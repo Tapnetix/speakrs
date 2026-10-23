@@ -34,11 +34,19 @@ use crate::inference::cuda::{
 
 // keep launch names and the shipped-entry inventory in the same definition
 macro_rules! kernel_entries {
-    ($($name:ident => $entry:literal),+ $(,)?) => {
+    (
+        $($name:ident => $entry:literal),+;
+        $($top:ident => $top_entry:literal),+ $(,)?
+    ) => {
         pub(super) mod entries {
             $(pub(super) const $name: &str = $entry;)+
+            $(pub(super) const $top: &str = $top_entry;)+
+            /// Entries every tier exports
             #[cfg(test)]
             pub(crate) const ALL: &[&str] = &[$($name),+];
+            /// Entries only the sm120 tier exports
+            #[cfg(test)]
+            pub(crate) const SM120: &[&str] = &[$($top),+];
         }
     };
 }
@@ -131,7 +139,27 @@ kernel_entries! {
     H16_C64S2_NARROW => "spk_wideconv_h16_c64s2_narrow",
     H16_C128S2 => "spk_wideconv_h16_c128s2",
     H16_C128S2_NARROW => "spk_wideconv_h16_c128s2_narrow",
-    PACK_H16 => "spk_wideconv_pack_h16",
+    PACK_H16 => "spk_wideconv_pack_h16";
+    // only the sm120 variant exports these
+    WH16_C64 => "spk_wideconv_wh16_c64",
+    WH16_C64_HALF_OUT => "spk_wideconv_wh16_c64_half_out",
+    WH16_C64_HALF_IN => "spk_wideconv_wh16_c64_half_in",
+    WH16_C64_HALF_IN_OUT => "spk_wideconv_wh16_c64_half_in_out",
+    WH16_C64_HALF_ALL => "spk_wideconv_wh16_c64_half_all",
+    WH16_C64_HALF_IN_RES => "spk_wideconv_wh16_c64_half_in_res",
+    WH16_C128 => "spk_wideconv_wh16_c128",
+    WH16_C128_HALF_OUT => "spk_wideconv_wh16_c128_half_out",
+    WH16_C128_HALF_IN => "spk_wideconv_wh16_c128_half_in",
+    WH16_C128_HALF_IN_OUT => "spk_wideconv_wh16_c128_half_in_out",
+    WH16_C128_HALF_ALL => "spk_wideconv_wh16_c128_half_all",
+    WH16_C128_HALF_IN_RES => "spk_wideconv_wh16_c128_half_in_res",
+    WH16_C256 => "spk_wideconv_wh16_c256",
+    WH16_C256_HALF_OUT => "spk_wideconv_wh16_c256_half_out",
+    WH16_C256_HALF_IN => "spk_wideconv_wh16_c256_half_in",
+    WH16_C256_HALF_IN_OUT => "spk_wideconv_wh16_c256_half_in_out",
+    WH16_C256_HALF_ALL => "spk_wideconv_wh16_c256_half_all",
+    WH16_C256_HALF_IN_RES => "spk_wideconv_wh16_c256_half_in_res",
+    PACK_WH16 => "spk_wideconv_pack_wh16",
 }
 
 /// The 22 trunk convolutions with a wideconv kernel, in trunk order
@@ -197,6 +225,10 @@ const C32_STRIDE2_LAYERS: [&str; 1] = ["resnet.layer2.0.conv1"];
 /// layers on FP16 tiles; the TF32 early trunk is faster at batches 1, 4 and 8
 const A100_FP16_C64_BATCHES: [usize; 2] = [16, 32];
 
+/// Embedding batch classes at which the RTX 5090 recipe runs the 64-channel same-channel
+/// layers on FP16 tiles; at batch 1 the TF32 early trunk ties or wins
+const RTX5090_FP16_C64_BATCHES: [usize; 4] = [4, 8, 16, 32];
+
 /// The capability whose FP32 mode runs `C64_LAYERS` here, in FFMA Winograd
 const TURING: ComputeCapability = ComputeCapability::new(7, 5);
 
@@ -259,6 +291,11 @@ pub(crate) enum Fp16Tiles {
     Wide,
     /// 64 channels of the 128- and 256-channel shapes, which doubles the CTAs of a batch
     Narrow,
+    /// Fused Winograd F(2x2, 3x3) on m16n8k16 FP16 products for the 64-, 128- and
+    /// 256-channel shapes: 64 channels by one row of 32 2x2 tiles per CTA, with the
+    /// operands of the direct tiles; sm120 tier only, which only the RTX 5090 binding
+    /// loads
+    Winograd,
 }
 
 /// The operands of a same-channel FP16 launch that are half tensors
@@ -292,6 +329,10 @@ impl HalfIo {
 /// Largest operand magnitude the FP16 tiles convert without saturating: the largest
 /// finite FP16 value, 65504, over the 2^10 operand scale
 pub(crate) const FP16_OPERAND_LIMIT: f32 = 65504.0 / 1024.0;
+/// Largest weight magnitude whose FP16 Winograd transform `U = G g G^T` stays below
+/// [`FP16_OPERAND_LIMIT`]: each row of `G` has absolute sum at most 1.5, so `U` is at
+/// most 2.25 times the largest weight of its filter
+pub(crate) const FP16_WINOGRAD_WEIGHT_LIMIT: f32 = FP16_OPERAND_LIMIT / 2.25;
 
 /// Whether selection may choose FP16 tiles for a boundary
 ///
@@ -303,27 +344,57 @@ pub(crate) enum Fp16Policy {
     /// Recipes, defaults and tune files may choose FP16 tiles
     #[default]
     Allowed,
+    /// As `Allowed`, without FP16 Winograd tiles: the weights' transform would saturate,
+    /// or the loaded wideconv variant lacks those tiles
+    Direct,
     /// Every source takes the choice it makes without FP16 tiles
     Excluded,
 }
 
 impl Fp16Policy {
-    /// Excluded when any weight is above [`FP16_OPERAND_LIMIT`] in magnitude or is NaN
+    /// Excluded when any weight is above [`FP16_OPERAND_LIMIT`] in magnitude or is NaN,
+    /// and direct only when any is above [`FP16_WINOGRAD_WEIGHT_LIMIT`]
     ///
-    /// The FP16 kernels pack the raw folded weights, so these are the values they convert
+    /// The direct FP16 kernels pack the raw folded weights, so these are the values they
+    /// convert
     pub(crate) fn of_weights(weights: &[f32]) -> Self {
-        if weights
-            .iter()
-            .all(|weight| weight.abs() <= FP16_OPERAND_LIMIT)
-        {
-            Self::Allowed
-        } else {
-            Self::Excluded
+        let largest = weights.iter().try_fold(0.0f32, |largest, weight| {
+            (weight.abs() <= FP16_OPERAND_LIMIT).then(|| largest.max(weight.abs()))
+        });
+        match largest {
+            None => Self::Excluded,
+            Some(largest) if largest > FP16_WINOGRAD_WEIGHT_LIMIT => Self::Direct,
+            Some(_) => Self::Allowed,
         }
     }
 
+    /// Whether sources may choose any FP16 tiles
     pub(crate) const fn allows(self) -> bool {
+        !matches!(self, Self::Excluded)
+    }
+
+    /// Whether sources may also choose FP16 Winograd tiles
+    pub(crate) const fn allows_winograd(self) -> bool {
         matches!(self, Self::Allowed)
+    }
+
+    /// The stricter of two policies
+    pub(crate) const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Excluded, _) | (_, Self::Excluded) => Self::Excluded,
+            (Self::Direct, _) | (_, Self::Direct) => Self::Direct,
+            _ => Self::Allowed,
+        }
+    }
+
+    /// This policy on a device whose loaded wideconv variant is `tier`: only the sm120
+    /// variant has FP16 Winograd tiles
+    pub(crate) const fn on_tier(self, tier: PtxTier) -> Self {
+        if matches!(tier, PtxTier::Sm120) {
+            self
+        } else {
+            self.and(Self::Direct)
+        }
     }
 }
 
@@ -462,6 +533,8 @@ const FP16_COLUMNS: u32 = 64;
 const FP16_S2_ROW_PIXELS: u32 = 136;
 /// Waves of wide FP16 CTAs below which the 128- and 256-channel shapes use narrow ones
 const FP16_WIDE_WAVES: u32 = 2;
+/// Dynamic shared bytes of an FP16 Winograd launch, as `WH16_SHARED_BYTES`
+const FP16_WINOGRAD_SHARED_BYTES: u32 = 58_208;
 
 /// Largest dynamic shared allocation a launch may request without opting in
 const DEFAULT_SHARED_LIMIT: u32 = 48 * 1024;
@@ -684,6 +757,60 @@ impl Pin {
             (Shape::C64Stride2, _) | (Shape::C128Stride2, 32) => Fp16Tiles::Wide,
             (Shape::C128 | Shape::C256 | Shape::C128Stride2, _) => Fp16Tiles::Narrow,
             _ => return None,
+        };
+        shape.fp16_entry(tiles)?;
+        Some(Self::Configured(Config {
+            algorithm: Algorithm::Fp16(tiles),
+            partition: Partition::Whole,
+            split_cells: SplitCells::All,
+        }))
+    }
+
+    /// FP16 tiles in TF32 mode at the RTX 5090 points where they beat the TF32 kernels:
+    /// the 32-channel layers, stride 2 included, at every batch, the 64-channel ones
+    /// from batch 4, the 128-channel ones from batch 8 and the same-channel 256-channel
+    /// ones from batch 16. The same-channel 64-, 128- and 256-channel layers take FP16
+    /// Winograd tiles when `fp16` allows them, the others wide direct tiles
+    ///
+    /// At batch 32 the FP16 Winograd tiles ran the same-channel 128- and 256-channel
+    /// layers 1.2-1.6x faster than the direct ones, and dev216 Cuda went from 27.0 to
+    /// 25.7 s with DER 7.0112 to 7.0123 and 7 of 216 RTTMs changed, the worst file by
+    /// +0.14 points; CudaFast went from 14.0 to 13.2 s with DER unchanged. Adding the
+    /// 64-channel layers, which ran 1.05-1.2x faster than the direct tiles, took Cuda
+    /// from 25.3 to 24.9 s with DER 7.0123 to 7.0119 and 4 RTTMs changed
+    ///
+    /// The thresholds come from a tune with the sm120 FP16 kernels, which pair taps into
+    /// m16n8k16 products. At batch 32 FP16 tiles ran the 32- and 64-channel layers
+    /// 1.6-2.5x faster than the TF32 rule, the 128-channel layers 1.15-1.35x faster than
+    /// TF32 Winograd, the 256-channel ones 1.1-1.15x, and the stride-2 layers 1.07-1.5x.
+    /// One batch class below each threshold the two stay within about 10% or the TF32
+    /// kernels win some layers of the shape, and at batch 1 the TF32 kernels win every
+    /// layer of 64 or more input channels
+    pub(crate) fn measured_rtx5090_fp16(
+        name: &str,
+        batch: usize,
+        math: CudaMath,
+        fp16: Fp16Policy,
+    ) -> Option<Self> {
+        if math != CudaMath::Tf32 {
+            return None;
+        }
+
+        let shape = Shape::of(model_conv(name, batch, math).ok()?).ok()?;
+        let from = match shape {
+            Shape::C32 | Shape::C32Stride2 => 1,
+            Shape::C64 | Shape::C64Stride2 => RTX5090_FP16_C64_BATCHES[0],
+            Shape::C128 | Shape::C128Stride2 => 8,
+            Shape::C256 => 16,
+            _ => return None,
+        };
+        if batch < from {
+            return None;
+        }
+
+        let tiles = match shape {
+            Shape::C64 | Shape::C128 | Shape::C256 if fp16.allows_winograd() => Fp16Tiles::Winograd,
+            _ => Fp16Tiles::Wide,
         };
         shape.fp16_entry(tiles)?;
         Some(Self::Configured(Config {
@@ -1145,10 +1272,13 @@ impl Shape {
         match (self, tiles) {
             (Self::C32, Fp16Tiles::Wide) => Some(entries::H16_C32),
             (Self::C64, Fp16Tiles::Wide) => Some(entries::H16_C64),
+            (Self::C64, Fp16Tiles::Winograd) => Some(entries::WH16_C64),
             (Self::C128, Fp16Tiles::Wide) => Some(entries::H16_C128),
             (Self::C128, Fp16Tiles::Narrow) => Some(entries::H16_C128_NARROW),
+            (Self::C128, Fp16Tiles::Winograd) => Some(entries::WH16_C128),
             (Self::C256, Fp16Tiles::Wide) => Some(entries::H16_C256),
             (Self::C256, Fp16Tiles::Narrow) => Some(entries::H16_C256_NARROW),
+            (Self::C256, Fp16Tiles::Winograd) => Some(entries::WH16_C256),
             (Self::C32Stride2, Fp16Tiles::Wide) => Some(entries::H16_C32S2),
             (Self::C64Stride2, Fp16Tiles::Wide) => Some(entries::H16_C64S2),
             (Self::C64Stride2, Fp16Tiles::Narrow) => Some(entries::H16_C64S2_NARROW),
@@ -1211,6 +1341,27 @@ impl Shape {
                 entries::H16_C256_NARROW_HALF_ALL,
                 entries::H16_C256_NARROW_HALF_IN_RES,
             ]),
+            (Self::C64, Fp16Tiles::Winograd) => Some([
+                entries::WH16_C64_HALF_OUT,
+                entries::WH16_C64_HALF_IN,
+                entries::WH16_C64_HALF_IN_OUT,
+                entries::WH16_C64_HALF_ALL,
+                entries::WH16_C64_HALF_IN_RES,
+            ]),
+            (Self::C128, Fp16Tiles::Winograd) => Some([
+                entries::WH16_C128_HALF_OUT,
+                entries::WH16_C128_HALF_IN,
+                entries::WH16_C128_HALF_IN_OUT,
+                entries::WH16_C128_HALF_ALL,
+                entries::WH16_C128_HALF_IN_RES,
+            ]),
+            (Self::C256, Fp16Tiles::Winograd) => Some([
+                entries::WH16_C256_HALF_OUT,
+                entries::WH16_C256_HALF_IN,
+                entries::WH16_C256_HALF_IN_OUT,
+                entries::WH16_C256_HALF_ALL,
+                entries::WH16_C256_HALF_IN_RES,
+            ]),
             _ => None,
         }
     }
@@ -1226,6 +1377,20 @@ impl Shape {
         oh: u32,
         ow: u32,
     ) -> Option<((u32, u32, u32), u32)> {
+        if tiles == Fp16Tiles::Winograd {
+            // one CTA per 64 output channels and row of 32 2x2 tiles, as the TF32 Winograd
+            let channels = match self {
+                Self::C64 => 64,
+                Self::C128 => 128,
+                Self::C256 => 256,
+                _ => return None,
+            };
+            let cells = batch * oh.div_ceil(2) * ow.div_ceil(2).div_ceil(WINO_TILES);
+            return Some((
+                (channels / WINO_CHANNELS, cells, 1),
+                FP16_WINOGRAD_SHARED_BYTES,
+            ));
+        }
         let (rows, cta_channels, channels) = match (self, tiles) {
             (Self::C32, Fp16Tiles::Wide) => (4, 32, 32),
             (Self::C64, Fp16Tiles::Wide) => (4, 64, 64),
@@ -1494,6 +1659,9 @@ impl Layout {
             shared_mem_bytes = shared;
             grid
         } else if let Algorithm::Fp16(tiles) = algorithm {
+            if tiles == Fp16Tiles::Winograd {
+                threads = WINO_THREADS;
+            }
             // checked above
             let (grid, shared) = shape
                 .fp16_launch(tiles, batch, oh, ow)
@@ -1620,6 +1788,10 @@ impl Oxide {
         if matches!(algorithm, Algorithm::TensorCore(_)) && kernels.tier() < PtxTier::Sm80 {
             return Err(unsupported("tensor-core tiles need the sm80 PTX tier"));
         }
+        if algorithm == Algorithm::Fp16(Fp16Tiles::Winograd) && kernels.tier() < PtxTier::Sm120 {
+            // only the sm120 variant exports these entries
+            return Err(unsupported("FP16 Winograd tiles need the sm120 PTX tier"));
+        }
         if let Algorithm::Winograd(products) = algorithm
             && products.tensor()
             && kernels.tier() < PtxTier::Sm80
@@ -1637,6 +1809,7 @@ impl Oxide {
             }
             Algorithm::Winograd(WinogradProducts::Bf16x3) => entries::PACK_WBF,
             Algorithm::Winograd(_) => entries::PACK_WTC,
+            Algorithm::Fp16(Fp16Tiles::Winograd) => entries::PACK_WH16,
             Algorithm::Fp16(_) => entries::PACK_H16,
             // the stem's weights are copied, not packed
             Algorithm::Spatial | Algorithm::WideStem | Algorithm::ImplicitGemm => {
@@ -1653,6 +1826,8 @@ impl Oxide {
             Algorithm::TensorCore(TensorKernel::Tf32x3 | TensorKernel::Tf32x3Wide) => {
                 weight_len * 2
             }
+            // a 4x4 transform per 3x3 filter, two FP16 values per word
+            Algorithm::Fp16(Fp16Tiles::Winograd) => weight_len / 9 * 8,
             // two FP16 weights per word
             Algorithm::Fp16(_) => weight_len / 2,
             _ => weight_len,
@@ -2396,7 +2571,7 @@ impl Oxide {
             },
         ]);
         match (capability == TURING, fp16) {
-            (true, Fp16Policy::Allowed) => TURING_COVERAGE,
+            (true, Fp16Policy::Allowed | Fp16Policy::Direct) => TURING_COVERAGE,
             (true, Fp16Policy::Excluded) => TURING_FP32_OPERANDS,
             (false, _) => <Self as ConvCandidate>::coverage(tier),
         }
@@ -2517,6 +2692,19 @@ const A100_FP16_COVERAGE: [CoverageEntry; 3] = [
     RTX4060TI_FP16_COVERAGE[2],
 ];
 
+/// The 5090 FP16 recipe adds the 32-channel layers, stride 2 included, at every batch
+/// and the same-channel 64-channel ones from batch 4
+const RTX5090_FP16_COVERAGE: [CoverageEntry; 4] = [
+    RTX4060TI_FP16_COVERAGE[0],
+    CoverageEntry {
+        layers: &C64_LAYERS,
+        batches: Batches::Only(&RTX5090_FP16_C64_BATCHES),
+        maths: Maths::Only(&[CudaMath::Tf32]),
+    },
+    RTX4060TI_FP16_COVERAGE[2],
+    RTX4090_FP16_COVERAGE[3],
+];
+
 /// The 4090 FP16 recipe also runs the 32->64 stride-2 layer on FP16 tiles
 const RTX4090_FP16_COVERAGE: [CoverageEntry; 4] = [
     RTX4060TI_FP16_COVERAGE[0],
@@ -2547,7 +2735,7 @@ impl super::DriverCandidate for Oxide {
             return Fp16Policy::Excluded;
         }
 
-        fp16
+        fp16.on_tier(tier)
     }
 
     fn driver_coverage(tier: PtxTier, device: &DeviceAttributes, fp16: Fp16Policy) -> Coverage {
@@ -2555,6 +2743,7 @@ impl super::DriverCandidate for Oxide {
         match Recipe::fp16_device(device, tier).filter(|_| fp16.allows()) {
             Some(Recipe::Rtx4060Ti) => Coverage(&RTX4060TI_FP16_COVERAGE),
             Some(Recipe::Rtx4090) => Coverage(&RTX4090_FP16_COVERAGE),
+            Some(Recipe::Rtx5090) => Coverage(&RTX5090_FP16_COVERAGE),
             Some(Recipe::A100Pcie | Recipe::A100Sxm4) => Coverage(&A100_FP16_COVERAGE),
             _ => Self::coverage_on(tier, device.capability(), fp16),
         }
@@ -2627,9 +2816,9 @@ impl super::DriverCandidate for Oxide {
         fp16: Fp16Policy,
     ) -> Result<super::ConfigPin, PlanError> {
         use crate::inference::cuda::implementation::policy::Recipe;
+        let fp16 = fp16.on_tier(tier);
         if let Some(pin) = Recipe::fp16_device(device, tier)
-            .filter(|_| fp16.allows())
-            .and_then(|recipe| recipe.fp16_pin(boundary, batch, math))
+            .and_then(|recipe| recipe.fp16_pin(boundary, batch, math, fp16))
         {
             return Ok(pin);
         }

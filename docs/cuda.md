@@ -60,6 +60,15 @@ name and SM count.
 - **A100 PCIe-40GB and SXM4-40GB (cc 8.0, 108 SMs):** use FP32 segmentation and
   TF32 embedding.
 - **RTX 4090:** has a measured recipe.
+- **RTX 5090 (cc 12.0, 170 SMs):** with FP32 segmentation and TF32 embedding, uses
+  FP16 trunk kernels for the 32-channel layers at every batch, the 64-channel ones
+  from batch 4, the 128-channel ones from batch 8 and the 256-channel ones from
+  batch 16, stride-2 layers included. It loads its own sm120 build of these
+  kernels, which does twice the FP16 work per tensor instruction and adds FP16
+  Winograd kernels for the same-channel 64-, 128- and 256-channel layers; other cc
+  12.x GPUs keep the sm80 build. Weights whose Winograd transform would leave the
+  FP16 range keep the direct FP16 kernels. On voxconverse-dev the Cuda run takes
+  24.9 s at 7.01% DER. Layers are grouped by input channels.
 
 Other devices use their kernel defaults. Measured speed evidence is reported,
 but isn't required to select a kernel. GPU-specific builds stay driver-only and
