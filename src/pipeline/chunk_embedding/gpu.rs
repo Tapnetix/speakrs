@@ -5,8 +5,112 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::audio_source::AudioSource;
 use crate::inference::coreml::{CachedInputShape, SharedCoreMlModel};
 
+use super::orchestrate::source_chunk_has_complete_first_window;
 use super::prep::{DecodedChunk, PrepScratch, TaggedDecoded};
 use super::{EmbeddingModel, PipelineError, backend_error, invariant_error};
+
+fn prepare_source_if_complete<S, F>(
+    source: &S,
+    decoded: DecodedChunk,
+    step_samples: usize,
+    window_samples: usize,
+    prepare: F,
+) -> Result<Option<PreparedChunk>, PipelineError>
+where
+    S: AudioSource + ?Sized,
+    F: FnOnce(DecodedChunk, &S) -> Result<PreparedChunk, PipelineError>,
+{
+    if !source_chunk_has_complete_first_window(
+        source.sample_count(),
+        decoded.global_start,
+        step_samples,
+        window_samples,
+    )? {
+        return Ok(None);
+    }
+    let prepared = prepare(decoded, source)?;
+    Ok(Some(prepared))
+}
+
+#[cfg(test)]
+mod source_tail_tests {
+    use super::{
+        invariant_error, prepare_source_if_complete, source_chunk_has_complete_first_window,
+    };
+    use crate::audio_source::{AudioSource, AudioSourceError};
+    use crate::pipeline::chunk_embedding::prep::DecodedChunk;
+    use ndarray::Array2;
+
+    struct GeometryOnlySource(usize);
+
+    impl AudioSource for GeometryOnlySource {
+        fn sample_count(&self) -> usize {
+            self.0
+        }
+
+        fn read_exact_samples(
+            &self,
+            _start: usize,
+            _destination: &mut [f32],
+        ) -> Result<(), AudioSourceError> {
+            unreachable!("the GPU worker must skip an incomplete source group before reading")
+        }
+    }
+
+    #[test]
+    fn gpu_worker_skips_tail_only_group_after_two_full_116_window_groups() {
+        let capacity = 116;
+        let full_windows = capacity * 2;
+        let window_samples = 160_000;
+        let step_samples = 15_360;
+        let sample_count = 3_715_160;
+        assert!(
+            source_chunk_has_complete_first_window(
+                sample_count,
+                full_windows - 1,
+                step_samples,
+                window_samples,
+            )
+            .unwrap()
+        );
+        assert!(
+            !source_chunk_has_complete_first_window(
+                sample_count,
+                full_windows,
+                step_samples,
+                window_samples,
+            )
+            .unwrap()
+        );
+        let source = GeometryOnlySource(sample_count);
+        let decoded = DecodedChunk {
+            global_start: full_windows,
+            decoded_chunk: vec![Array2::zeros((1, 1))],
+        };
+        let mut prep_called = false;
+
+        let prepared = prepare_source_if_complete(
+            &source,
+            decoded,
+            step_samples,
+            window_samples,
+            |_decoded, _source| {
+                prep_called = true;
+                Err(invariant_error("source chunk has no complete window"))
+            },
+        )
+        .unwrap();
+
+        assert!(
+            prepared.is_none(),
+            "GPU worker must discard the tail-only group"
+        );
+        assert!(
+            !prep_called,
+            "GPU worker must not call prep_source for the tail-only group"
+        );
+    }
+}
 
 impl ChunkEmbeddingResources {
     pub(super) fn largest_session(&self) -> Result<LargestChunkSession, PipelineError> {
@@ -136,34 +240,45 @@ impl GpuWorker {
         decoded_done: &mut bool,
         total_prep_us: &mut u64,
     ) -> Result<Option<PreparedChunk>, PipelineError> {
-        match prep_rx.try_recv() {
-            Ok(prepared) => return Ok(Some(prepared)),
-            Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(None),
-            Err(crossbeam_channel::TryRecvError::Empty) => {}
-        }
-        if *decoded_done {
-            return Ok(prep_rx.recv().ok());
-        }
-        let mut decode = |this: &mut Self,
-                          decoded: DecodedChunk|
-         -> Result<Option<PreparedChunk>, PipelineError> {
-            let started = std::time::Instant::now();
-            let prepared = this.prep.prep_source(decoded, source, &mut this.scratch)?;
-            *total_prep_us += started.elapsed().as_micros() as u64;
-            Ok(Some(prepared))
-        };
-        match chunk_rx.try_recv() {
-            Ok(decoded) => decode(self, decoded),
-            Err(crossbeam_channel::TryRecvError::Empty) => crossbeam_channel::select! {
-                recv(prep_rx) -> message => Ok(message.ok()),
-                recv(chunk_rx) -> message => match message {
-                    Ok(decoded) => decode(self, decoded),
-                    Err(_) => { *decoded_done = true; Ok(prep_rx.recv().ok()) }
+        loop {
+            match prep_rx.try_recv() {
+                Ok(prepared) => return Ok(Some(prepared)),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(None),
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+            if *decoded_done {
+                return Ok(prep_rx.recv().ok());
+            }
+
+            let decoded = match chunk_rx.try_recv() {
+                Ok(decoded) => decoded,
+                Err(crossbeam_channel::TryRecvError::Empty) => crossbeam_channel::select! {
+                    recv(prep_rx) -> message => return Ok(message.ok()),
+                    recv(chunk_rx) -> message => match message {
+                        Ok(decoded) => decoded,
+                        Err(_) => {
+                            *decoded_done = true;
+                            return Ok(prep_rx.recv().ok());
+                        }
+                    },
                 },
-            },
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                *decoded_done = true;
-                Ok(prep_rx.recv().ok())
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    *decoded_done = true;
+                    return Ok(prep_rx.recv().ok());
+                }
+            };
+
+            let prep_start = std::time::Instant::now();
+            let prepared = prepare_source_if_complete(
+                source,
+                decoded,
+                self.prep.step_samples,
+                self.prep.window_samples,
+                |decoded, source| self.prep.prep_source(decoded, source, &mut self.scratch),
+            )?;
+            if let Some(prepared) = prepared {
+                *total_prep_us += prep_start.elapsed().as_micros() as u64;
+                return Ok(Some(prepared));
             }
         }
     }

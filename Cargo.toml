@@ -44,7 +44,7 @@ ndarray = "0.17.2"
 ndarray-linalg-mkl = { package = "ndarray-linalg", version = "0.18.1", features = ["intel-mkl-static"], optional = true }
 ndarray-linalg-static = { package = "ndarray-linalg", version = "0.18.1", features = ["openblas-static"], optional = true }
 ndarray-linalg-system = { package = "ndarray-linalg", version = "0.18.1", features = ["openblas-system"], optional = true }
-# Match the published 0.5.0 manifest normalization; speakrs reads .npy only.
+# RecapIt commit 2abc48aa disables unused ndarray-npy defaults to keep the app dependency graph minimal.
 ndarray-npy = { version = "0.10.0", default-features = false }
 
 ort = { version = "2.0.0-rc.12", features = ["ndarray"] }

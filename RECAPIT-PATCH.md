@@ -2,7 +2,7 @@
 
 This public fork is based on `avencera/speakrs` source commit `96f3cec0756bc9df7f830a9ed31e782ddd445edd`, the source revision recorded in the `speakrs` 0.5.0 crates.io archive's `.cargo_vcs_info.json`. The verified archive SHA-256 is `b7ed3d9e4670beaa31736bc2baf3736aca4554920edeb6ed463c903da9df57ac`; its `Cargo.toml.orig` matches the manifest at that source commit. The archive's generated normalized `Cargo.toml` is packaging metadata and is not used as the fork's source manifest. The upstream `LICENSE` remains unchanged.
 
-The fork disables `ndarray-npy` default features to match the published 0.5.0 package normalization and preserve the app's locked dependency graph; speakrs uses `.npy` files only.
+RecapIt commit `2abc48aa` disabled `ndarray-npy` default features to preserve the app's locked dependency graph. This is a RecapIt source change, not crates.io manifest normalization; speakrs uses `.npy` files only.
 
 ## B11 bounded source-backed processing
 

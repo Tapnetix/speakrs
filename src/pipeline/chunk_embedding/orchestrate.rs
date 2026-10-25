@@ -72,7 +72,7 @@ fn chunk_embedding_window_count(
     sample_count.saturating_sub(window_samples) / step_samples + 1
 }
 
-fn source_chunk_has_complete_first_window(
+pub(super) fn source_chunk_has_complete_first_window(
     sample_count: usize,
     global_start: usize,
     step_samples: usize,
