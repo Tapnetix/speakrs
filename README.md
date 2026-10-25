@@ -201,9 +201,11 @@ Start here:
 
 <!-- cargo-rdme end -->
 
-## [Contributing](CONTRIBUTING.md)
+## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, model downloads, fixture generation, and the standard check commands used in this repo.
+The vendored v0.5.0 source snapshot does not include `CONTRIBUTING.md`. The [upstream guide at the pinned v0.5.0 source commit](https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/CONTRIBUTING.md) describes the upstream development workflow, including model-dependent tests.
+
+This RecapIt fork preserves the 23 upstream numerical fixtures and their provenance in [`fixtures/UPSTREAM_PROVENANCE.json`](fixtures/UPSTREAM_PROVENANCE.json). The offline fixture-only subset can be checked without downloading models; tests that load `fixtures/models`, audio, or inference backends remain outside that subset. See [`fixtures/README.md`](fixtures/README.md).
 
 ## References
 

@@ -1,0 +1,196 @@
+{
+  "schema": "speakrs-upstream-fixture-provenance-v1",
+  "repository": "https://github.com/avencera/speakrs",
+  "tag": "v0.5.0",
+  "commit": "96f3cec0756bc9df7f830a9ed31e782ddd445edd",
+  "crateLicense": "Apache-2.0 (existing vendored LICENSE)",
+  "fixtureCount": 23,
+  "totalBytes": 269131,
+  "modelOrAudioAssetsIncluded": false,
+  "files": [
+    {
+      "path": "pipeline_ahc_clusters.npy",
+      "bytes": 344,
+      "sha256": "a3bfd4ca328574a7a12ad86a646de0719d9291a10f922b9ae366d39ad48bde54",
+      "upstreamGitBlob": "9db033520e29f6fa3e7ad1e5747224f9657051e8",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_ahc_clusters.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_embeddings_data.npy",
+      "bytes": 55424,
+      "sha256": "3d32440af9bfc4f48b363db4c416d4068cf3f5ef7e14ed47d1efd539d8963fb7",
+      "upstreamGitBlob": "74dde95cea12bfd2c99ff150f3a9e8d9abfcfc8a",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_embeddings_data.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_hard_clusters.npy",
+      "bytes": 182,
+      "sha256": "7399edad68d8efa3107063f4fa8d1632b453c364d744a65095972a7f66781211",
+      "upstreamGitBlob": "dd02da06dfe6bfa0ae037fa4db3a9d6dc3d35f31",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_hard_clusters.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_plda_features.npy",
+      "bytes": 27776,
+      "sha256": "e141fc422c55543d24e9b4190b6a96e3541b7bf78bfb6d0fcf622f96f5fb34ff",
+      "upstreamGitBlob": "5326580ced447593dbc27162797bcac68f93ab85",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_plda_features.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_plda_phi.npy",
+      "bytes": 1152,
+      "sha256": "1f403ada4969a5897b24912e5c25b81ed446b3a513a90135bef3c5c885992677",
+      "upstreamGitBlob": "92a9e693f4a64dd30811eef4fd532588a517e9ad",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_plda_phi.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_segmentation_data.npy",
+      "bytes": 127352,
+      "sha256": "915dd3f296aebd76e6d4390a7d9674973dd2d17ff5161d48fdb8b19c93df7fde",
+      "upstreamGitBlob": "eab6e3176777897c2e2a1919672b4b6109901c5b",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_segmentation_data.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_speaker_counting_data.npy",
+      "bytes": 1729,
+      "sha256": "b4e2290f5703423aa765c05acad5c0d5d360c36183fdef034652d358996c7a6b",
+      "upstreamGitBlob": "ed7334f671ad5f03867a52a7cb3b636c0e3f1bc5",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_speaker_counting_data.npy",
+      "referencedByCurrentRustTests": false
+    },
+    {
+      "path": "pipeline_train_chunk_idx.npy",
+      "bytes": 344,
+      "sha256": "a68c61f632de1e3e77dd7d1f9381f2c633aa0c9b757a770c4187651f12d92ad3",
+      "upstreamGitBlob": "171b878e06cfa260b5e91abf6368113cf0ef864e",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_train_chunk_idx.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_train_embeddings.npy",
+      "bytes": 27776,
+      "sha256": "facd06e79123c88e90984f0a7d6ba5134dad0b6a71a8fe742949ec48c944e18d",
+      "upstreamGitBlob": "a7f094b38b12171e707ab22bf6d425d002cec48a",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_train_embeddings.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_train_speaker_idx.npy",
+      "bytes": 344,
+      "sha256": "7093751cce308211d8546c70d2cedf3d8b966291b0d2d9dfa9088e3b95699c74",
+      "upstreamGitBlob": "fb73f7706cb159b009ffc2c0cd9d56e6d11a689f",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_train_speaker_idx.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_vbx_gamma.npy",
+      "bytes": 560,
+      "sha256": "481e834f873a57f2e07f85434e328cb199b72e629d1469440852e347f17d352d",
+      "upstreamGitBlob": "dce6694b1d6aa5a48d73781a03fea1f3d61bd230",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_vbx_gamma.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "pipeline_vbx_pi.npy",
+      "bytes": 144,
+      "sha256": "62a13db0e387b4fb2292f485ebe41ff95c63c703d8c5a9f9a2f3c3e43d33c36e",
+      "upstreamGitBlob": "6237efb9170c7fe61ac4a06dfa283a902ac91364",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/pipeline_vbx_pi.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_hard_output.npy",
+      "bytes": 7196,
+      "sha256": "0ab5d0f499f256142b00bb4c9406a5dad174019e3beb9fbc134f99f8de5b7d95",
+      "upstreamGitBlob": "7d7a0131f7c8de42133dc7ff2af084275464b191",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_hard_output.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_input_logits.npy",
+      "bytes": 16620,
+      "sha256": "af37caa3c6dec6c2a844b3389da2ac0407b778472fdec40cf80736fbd17b1018",
+      "upstreamGitBlob": "e246e21b75a76629d975ef029cc8b6c9e9fdbc99",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_input_logits.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_2_1.npy",
+      "bytes": 152,
+      "sha256": "b4a76133a4eca1a5349eb6f17e394dc6bfd92b1addb8d8ec11adae3fb44beb6a",
+      "upstreamGitBlob": "a080e96410358e0f14d004f28a05064e75960eb3",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_2_1.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_2_2.npy",
+      "bytes": 160,
+      "sha256": "ba92348bf6a41d95b881790fb8bad292cc87c5230e3c0bc69368aad3e8e703ea",
+      "upstreamGitBlob": "4774f032d6775f77be6640b5c7baf61ef878d323",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_2_2.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_3_1.npy",
+      "bytes": 176,
+      "sha256": "206e1a7842fafa11c76007afba1504750ce0f9946b36f553ef1d5ea8e49f8dae",
+      "upstreamGitBlob": "0b83e303c31d9bbae037b7a87685d3abcc8cda9a",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_3_1.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_3_2.npy",
+      "bytes": 212,
+      "sha256": "7a0fbed3e7d716f25f9663659f7a609d1aa801cd772f7ada2ec0f0feaa7a26c4",
+      "upstreamGitBlob": "189e7cf9f988f33cf9790e6b79ea7e0c211b00a9",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_3_2.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_3_3.npy",
+      "bytes": 224,
+      "sha256": "7214d1a6ac222790dd7d50f12db9852126f7352c0e3cec065b3044532a862c77",
+      "upstreamGitBlob": "926aa4a01b5229863104205a705f945fc21358aa",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_3_3.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_4_1.npy",
+      "bytes": 208,
+      "sha256": "9ad8a9aa3f05e871927a54c455d75c9a2dc4c75f828188016f2071162154dad2",
+      "upstreamGitBlob": "bc13b12e1cd023714454b0847d7e23bbf0c76def",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_4_1.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_4_2.npy",
+      "bytes": 304,
+      "sha256": "7901a1509776bb3b9364792c45e7597c54619806b52163de00531850bec4af00",
+      "upstreamGitBlob": "a92b877fc850ee3bb3e88308f8a43df349a50b41",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_4_2.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_4_3.npy",
+      "bytes": 368,
+      "sha256": "ba6d71120ee5f9a6ad8922522b904749145697f97a249dbe0ebc2e1e7b262449",
+      "upstreamGitBlob": "a9bffae7be898a9b0c0e6e15155d1bd7a7ea63a4",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_4_3.npy",
+      "referencedByCurrentRustTests": true
+    },
+    {
+      "path": "powerset_mapping_4_4.npy",
+      "bytes": 384,
+      "sha256": "12e105ea0a5aeb0fd25f51f77f2d48b129903b593c15f3be36df8a959fa19c81",
+      "upstreamGitBlob": "143f26ebdf96c755a41ddfa72562fe82ca298a0c",
+      "upstreamUrl": "https://github.com/avencera/speakrs/blob/96f3cec0756bc9df7f830a9ed31e782ddd445edd/fixtures/powerset_mapping_4_4.npy",
+      "referencedByCurrentRustTests": true
+    }
+  ]
+}
