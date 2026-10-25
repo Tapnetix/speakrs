@@ -9,7 +9,32 @@ use super::ChunkLayout;
 pub(in crate::pipeline) struct PendingEmbedding<'a> {
     pub chunk_idx: usize,
     pub speaker_idx: usize,
-    pub audio: &'a [f32],
+    pub audio: PendingEmbeddingAudio<'a>,
+    pub mask: Vec<f32>,
+    pub clean_mask: Vec<f32>,
+}
+
+#[derive(Clone)]
+pub(in crate::pipeline) enum PendingEmbeddingAudio<'a> {
+    Borrowed(&'a [f32]),
+    Owned(std::sync::Arc<[f32]>),
+}
+
+impl PendingEmbeddingAudio<'_> {
+    pub fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Borrowed(audio) => audio,
+            Self::Owned(audio) => audio,
+        }
+    }
+}
+
+/// A source-backed masked embedding batch shares one owned waveform chunk among its active
+/// speakers. The caller caps the number of pending speaker rows at the model batch size.
+pub(in crate::pipeline) struct PendingSourceEmbedding {
+    pub chunk_idx: usize,
+    pub speaker_idx: usize,
+    pub audio: std::sync::Arc<[f32]>,
     pub mask: Vec<f32>,
     pub clean_mask: Vec<f32>,
 }

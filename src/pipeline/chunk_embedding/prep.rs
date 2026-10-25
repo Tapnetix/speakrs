@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::audio_source::AudioSource;
 use crate::inference::coreml::{CachedInputShape, SharedCoreMlModel};
 
 use super::gpu::{PreparedChunk, TaggedPrepared};
@@ -136,6 +137,69 @@ impl ChunkPrep {
             num_masks: self.largest_num_masks,
         })
     }
+
+    pub(super) fn prep_source<S: AudioSource + ?Sized>(
+        &self,
+        decoded: DecodedChunk,
+        source: &S,
+        scratch: &mut PrepScratch,
+    ) -> Result<PreparedChunk, PipelineError> {
+        let global_start = decoded.global_start;
+        let audio = read_source_chunk(
+            source,
+            global_start,
+            decoded.decoded_chunk.len(),
+            self.step_samples,
+            self.window_samples,
+        )?;
+        let local = DecodedChunk {
+            global_start: 0,
+            decoded_chunk: decoded.decoded_chunk,
+        };
+        let mut prepared = self.prep(local, &audio, scratch)?;
+        prepared.global_start = global_start;
+        Ok(prepared)
+    }
+}
+
+pub(super) fn read_source_chunk<S: AudioSource + ?Sized>(
+    source: &S,
+    global_start: usize,
+    num_windows: usize,
+    step_samples: usize,
+    window_samples: usize,
+) -> Result<Vec<f32>, PipelineError> {
+    if num_windows == 0 {
+        return Err(super::invariant_error("source chunk contains no windows"));
+    }
+    let start = global_start
+        .checked_mul(step_samples)
+        .ok_or_else(|| super::invariant_error("source chunk offset overflowed"))?;
+    let span = window_samples
+        .checked_add(
+            (num_windows - 1)
+                .checked_mul(step_samples)
+                .ok_or_else(|| super::invariant_error("source chunk length overflowed"))?,
+        )
+        .ok_or_else(|| super::invariant_error("source chunk length overflowed"))?;
+    let available = source
+        .sample_count()
+        .checked_sub(start)
+        .ok_or_else(|| super::invariant_error("source chunk starts beyond the recording"))?;
+    if available < window_samples {
+        return Err(super::invariant_error(
+            "source chunk has no complete window",
+        ));
+    }
+    let mut audio = vec![0.0; span.min(available)];
+    source
+        .read_exact_samples(start, &mut audio)
+        .map_err(|error| {
+            PipelineError::Segmentation(
+                crate::inference::segmentation::SegmentationError::AudioSource(error),
+            )
+        })?;
+    Ok(audio)
 }
 
 pub(super) struct PrepWorker {
@@ -161,6 +225,35 @@ impl PrepWorker {
             }
             let prep_start = std::time::Instant::now();
             let prepared = self.prep.prep(decoded, audio, &mut self.scratch)?;
+            stats.fbank_us += prep_start.elapsed().as_micros() as u64;
+            stats.chunks += 1;
+            if prep_tx.send(prepared).is_err() {
+                break;
+            }
+        }
+        Ok(stats)
+    }
+
+    pub(super) fn run_source<S: AudioSource + ?Sized>(
+        mut self,
+        source: &S,
+        chunk_rx: &Receiver<DecodedChunk>,
+        prep_tx: Sender<PreparedChunk>,
+    ) -> Result<PrepStats, PipelineError> {
+        let mut stats = PrepStats::default();
+        while let Ok(decoded) = chunk_rx.recv() {
+            let start = decoded
+                .global_start
+                .checked_mul(self.prep.step_samples)
+                .ok_or_else(|| super::invariant_error("source chunk offset overflowed"))?;
+            if start
+                .checked_add(self.prep.window_samples)
+                .is_none_or(|end| end > source.sample_count())
+            {
+                continue;
+            }
+            let prep_start = std::time::Instant::now();
+            let prepared = self.prep.prep_source(decoded, source, &mut self.scratch)?;
             stats.fbank_us += prep_start.elapsed().as_micros() as u64;
             stats.chunks += 1;
             if prep_tx.send(prepared).is_err() {
@@ -249,4 +342,77 @@ pub(super) struct TaggedDecoded {
     pub(super) file_idx: usize,
     pub(super) local_start: usize,
     pub(super) decoded_chunk: Vec<ndarray::Array2<f32>>,
+}
+
+#[cfg(test)]
+mod source_chunk_tests {
+    use super::read_source_chunk;
+    use crate::audio_source::{AudioSource, AudioSourceError};
+
+    struct TrackingSource {
+        samples: Vec<f32>,
+        max_read: std::sync::atomic::AtomicUsize,
+        cancel: bool,
+    }
+
+    impl AudioSource for TrackingSource {
+        fn sample_count(&self) -> usize {
+            self.samples.len()
+        }
+
+        fn read_exact_samples(
+            &self,
+            start: usize,
+            destination: &mut [f32],
+        ) -> Result<(), AudioSourceError> {
+            self.max_read
+                .fetch_max(destination.len(), std::sync::atomic::Ordering::Relaxed);
+            if self.cancel {
+                return Err(AudioSourceError::Cancelled);
+            }
+            let end = start
+                .checked_add(destination.len())
+                .ok_or(AudioSourceError::Overflow)?;
+            destination.copy_from_slice(
+                self.samples
+                    .get(start..end)
+                    .ok_or(AudioSourceError::InvalidRange)?,
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn source_embedding_batch_reads_only_its_bounded_chunk_range() {
+        let source = TrackingSource {
+            samples: (0..256).map(|sample| sample as f32).collect(),
+            max_read: std::sync::atomic::AtomicUsize::new(0),
+            cancel: false,
+        };
+        let chunk = read_source_chunk(&source, 5, 64, 2, 4).unwrap();
+        assert_eq!(chunk.len(), 130);
+        assert_eq!(chunk.first(), Some(&10.0));
+        assert_eq!(chunk.last(), Some(&139.0));
+        assert_eq!(
+            source.max_read.load(std::sync::atomic::Ordering::Relaxed),
+            130
+        );
+    }
+
+    #[test]
+    fn source_embedding_batch_propagates_cancellation() {
+        let source = TrackingSource {
+            samples: vec![0.0; 256],
+            max_read: std::sync::atomic::AtomicUsize::new(0),
+            cancel: true,
+        };
+        assert!(matches!(
+            read_source_chunk(&source, 0, 32, 2, 4),
+            Err(crate::pipeline::PipelineError::Segmentation(
+                crate::inference::segmentation::SegmentationError::AudioSource(
+                    AudioSourceError::Cancelled
+                )
+            ))
+        ));
+    }
 }

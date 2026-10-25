@@ -1,9 +1,9 @@
 use crossbeam_channel::{Receiver, Sender};
-use ndarray::{Array2, Array3, s};
+use ndarray::{Array2, Array3};
 
 use super::{
-    ParallelProfile, SegmentationError, SegmentationWindows, SharedCoreMlModel, WorkerErrorSlot,
-    segmentation_array, worker_panic,
+    ParallelProfile, SegmentationError, SegmentationWindowReader, SharedCoreMlModel,
+    WorkerErrorSlot, segmentation_array, worker_panic,
 };
 use crate::inference::coreml::CachedInputShape;
 use crate::inference::segmentation::tensor::array3_slice;
@@ -12,7 +12,7 @@ type WorkerTx = Sender<Array2<f32>>;
 type WorkerRx = Receiver<Array2<f32>>;
 
 pub(super) struct ParallelSingleExecutor<'a> {
-    pub(super) windows: &'a SegmentationWindows<'a>,
+    pub(super) windows: &'a dyn SegmentationWindowReader,
     pub(super) tx: Sender<Array2<f32>>,
     pub(super) model: &'a SharedCoreMlModel,
     pub(super) num_workers: usize,
@@ -54,11 +54,13 @@ impl SingleScratch {
         }
     }
 
-    fn load_window(&mut self, window: &[f32]) {
-        self.buffer.fill(0.0);
+    fn window_buffer_mut(&mut self) -> Result<&mut [f32], SegmentationError> {
         self.buffer
-            .slice_mut(s![0, 0, ..window.len()])
-            .assign(&ndarray::ArrayView1::from(window));
+            .as_slice_mut()
+            .ok_or_else(|| SegmentationError::Invariant {
+                context: "parallel segmentation worker input",
+                message: "input buffer was not contiguous".to_owned(),
+            })
     }
 
     fn input_data(&self) -> Result<&[f32], SegmentationError> {
@@ -86,11 +88,11 @@ impl WorkerChannels {
     }
 }
 
-struct SingleWorker<'ctx, 'a> {
+struct SingleWorker<'ctx> {
     worker_idx: usize,
     start: usize,
     end: usize,
-    windows: &'ctx SegmentationWindows<'a>,
+    windows: &'ctx dyn SegmentationWindowReader,
     model: &'ctx SharedCoreMlModel,
     worker_tx: Sender<Array2<f32>>,
     worker_error: WorkerErrorSlot,
@@ -98,11 +100,14 @@ struct SingleWorker<'ctx, 'a> {
     window_samples: usize,
 }
 
-impl<'ctx, 'a> SingleWorker<'ctx, 'a> {
+impl<'ctx> SingleWorker<'ctx> {
     fn run(self) {
         let mut scratch = SingleScratch::new(self.window_samples);
 
         for window_idx in self.start..self.end {
+            if self.worker_error.is_set() {
+                return;
+            }
             let result = match self.process_window(window_idx, &mut scratch) {
                 Ok(result) => result,
                 Err(error) => {
@@ -122,22 +127,13 @@ impl<'ctx, 'a> SingleWorker<'ctx, 'a> {
         window_idx: usize,
         scratch: &mut SingleScratch,
     ) -> Result<Array2<f32>, SegmentationError> {
-        let window = self.resolve_window(window_idx)?;
-        scratch.load_window(window);
+        self.windows.read_window_into(
+            window_idx,
+            scratch.window_buffer_mut()?,
+            "parallel segmentation worker",
+        )?;
         let (data, frames, classes) = self.predict(scratch)?;
         self.decode_result(data, frames, classes)
-    }
-
-    fn resolve_window(&self, window_idx: usize) -> Result<&[f32], SegmentationError> {
-        self.windows
-            .window(window_idx, "parallel segmentation worker")
-            .map_err(|_| SegmentationError::Invariant {
-                context: "parallel segmentation worker",
-                message: format!(
-                    "failed to resolve window {window_idx} for worker {}",
-                    self.worker_idx
-                ),
-            })
     }
 
     fn predict(
@@ -165,8 +161,8 @@ impl<'ctx, 'a> SingleWorker<'ctx, 'a> {
     }
 }
 
-struct SingleWorkerPool<'ctx, 'a> {
-    windows: &'ctx SegmentationWindows<'a>,
+struct SingleWorkerPool<'ctx> {
+    windows: &'ctx dyn SegmentationWindowReader,
     model: &'ctx SharedCoreMlModel,
     chunk_size: usize,
     total_windows: usize,
@@ -175,7 +171,7 @@ struct SingleWorkerPool<'ctx, 'a> {
     worker_error: WorkerErrorSlot,
 }
 
-impl<'ctx, 'a> SingleWorkerPool<'ctx, 'a> {
+impl<'ctx> SingleWorkerPool<'ctx> {
     fn run(&self, worker_txs: Vec<WorkerTx>) {
         rayon::scope(|rscope| {
             for (worker_idx, worker_tx) in worker_txs.into_iter().enumerate() {
@@ -185,7 +181,7 @@ impl<'ctx, 'a> SingleWorkerPool<'ctx, 'a> {
         });
     }
 
-    fn worker(&self, worker_idx: usize, worker_tx: WorkerTx) -> SingleWorker<'ctx, 'a> {
+    fn worker(&self, worker_idx: usize, worker_tx: WorkerTx) -> SingleWorker<'ctx> {
         let start = worker_idx * self.chunk_size;
         let end = (start + self.chunk_size).min(self.total_windows);
 

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::audio_source::AudioSource;
 use crate::inference::coreml::{CachedInputShape, SharedCoreMlModel};
 
 use super::prep::{DecodedChunk, PrepScratch, TaggedDecoded};
@@ -127,6 +128,46 @@ impl GpuWorker {
         }
     }
 
+    fn next_prepared_source<S: AudioSource + ?Sized>(
+        &mut self,
+        source: &S,
+        prep_rx: &Receiver<PreparedChunk>,
+        chunk_rx: &Receiver<DecodedChunk>,
+        decoded_done: &mut bool,
+        total_prep_us: &mut u64,
+    ) -> Result<Option<PreparedChunk>, PipelineError> {
+        match prep_rx.try_recv() {
+            Ok(prepared) => return Ok(Some(prepared)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(None),
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+        if *decoded_done {
+            return Ok(prep_rx.recv().ok());
+        }
+        let mut decode = |this: &mut Self,
+                          decoded: DecodedChunk|
+         -> Result<Option<PreparedChunk>, PipelineError> {
+            let started = std::time::Instant::now();
+            let prepared = this.prep.prep_source(decoded, source, &mut this.scratch)?;
+            *total_prep_us += started.elapsed().as_micros() as u64;
+            Ok(Some(prepared))
+        };
+        match chunk_rx.try_recv() {
+            Ok(decoded) => decode(self, decoded),
+            Err(crossbeam_channel::TryRecvError::Empty) => crossbeam_channel::select! {
+                recv(prep_rx) -> message => Ok(message.ok()),
+                recv(chunk_rx) -> message => match message {
+                    Ok(decoded) => decode(self, decoded),
+                    Err(_) => { *decoded_done = true; Ok(prep_rx.recv().ok()) }
+                },
+            },
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                *decoded_done = true;
+                Ok(prep_rx.recv().ok())
+            }
+        }
+    }
+
     fn predict(&self, prepared: &PreparedChunk) -> Result<(Vec<f32>, u64), PipelineError> {
         let predict_start = std::time::Instant::now();
         let (data, _) = self
@@ -185,6 +226,48 @@ impl GpuWorker {
         Ok(GpuStats {
             predict_us: total_predict_us,
             chunks: chunk_num,
+            self_prep_us: total_prep_us,
+        })
+    }
+
+    pub(super) fn run_source<S: AudioSource + ?Sized>(
+        mut self,
+        source: &S,
+        prep_rx: Receiver<PreparedChunk>,
+        chunk_rx: Receiver<DecodedChunk>,
+        emb_tx: Sender<EmbeddedChunk>,
+    ) -> Result<GpuStats, PipelineError> {
+        let mut total_predict_us = 0u64;
+        let mut total_prep_us = 0u64;
+        let mut chunks = 0u32;
+        let mut decoded_done = false;
+        while let Some(prepared) = self.next_prepared_source(
+            source,
+            &prep_rx,
+            &chunk_rx,
+            &mut decoded_done,
+            &mut total_prep_us,
+        )? {
+            let (data, predict_us) = self.predict(&prepared)?;
+            total_predict_us += predict_us;
+            chunks += 1;
+            if emb_tx
+                .send(EmbeddedChunk {
+                    global_start: prepared.global_start,
+                    decoded_chunk: prepared.decoded_chunk,
+                    data,
+                    active: prepared.active,
+                    num_masks: prepared.num_masks,
+                    predict_us,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok(GpuStats {
+            predict_us: total_predict_us,
+            chunks,
             self_prep_us: total_prep_us,
         })
     }

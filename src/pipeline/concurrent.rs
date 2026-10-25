@@ -1,14 +1,74 @@
 use ndarray::{Array2, Array3, s};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
+use crate::audio_source::{AudioSourceError, AudioWindowPlan};
 use crate::inference::embedding::EmbeddingModel;
 use crate::powerset::PowersetMapping;
 
 use super::config::MIN_SPEAKER_ACTIVITY;
 use super::types::{
-    Array3Writer, EmbeddingStorage, PendingEmbedding, PendingSplitEmbedding, PipelineError,
-    chunk_audio_raw, flush_masked, flush_split,
+    Array3Writer, EmbeddingStorage, PendingEmbedding, PendingEmbeddingAudio, PendingSplitEmbedding,
+    PipelineError, chunk_audio_raw, flush_masked, flush_split,
 };
+
+pub(super) enum ConcurrentAudio<'a> {
+    Slice(&'a [f32]),
+    Source {
+        sample_count: usize,
+        read_exact: &'a dyn Fn(usize, &mut [f32]) -> Result<(), AudioSourceError>,
+    },
+}
+
+impl ConcurrentAudio<'_> {
+    fn sample_count(&self) -> usize {
+        match self {
+            Self::Slice(audio) => audio.len(),
+            Self::Source { sample_count, .. } => *sample_count,
+        }
+    }
+
+    fn total_windows(&self, window_samples: usize, step_samples: usize) -> usize {
+        AudioWindowPlan::new(self.sample_count(), window_samples, step_samples)
+            .map(|plan| plan.window_count())
+            .unwrap_or(0)
+    }
+
+    fn window(
+        &self,
+        step_samples: usize,
+        window_samples: usize,
+        chunk_idx: usize,
+    ) -> Result<PendingEmbeddingAudio<'_>, PipelineError> {
+        match self {
+            Self::Slice(audio) => Ok(PendingEmbeddingAudio::Borrowed(chunk_audio_raw(
+                audio,
+                step_samples,
+                window_samples,
+                chunk_idx,
+            ))),
+            Self::Source {
+                sample_count,
+                read_exact,
+            } => {
+                let start = chunk_idx.checked_mul(step_samples).ok_or_else(|| {
+                    PipelineError::Invariant("audio window offset overflowed".to_owned())
+                })?;
+                let available = sample_count.checked_sub(start).ok_or_else(|| {
+                    PipelineError::Invariant("audio window starts beyond source".to_owned())
+                })?;
+                let length = available.min(window_samples);
+                let mut samples = vec![0.0; length];
+                read_exact(start, &mut samples).map_err(|error| {
+                    PipelineError::Segmentation(
+                        crate::inference::segmentation::SegmentationError::AudioSource(error),
+                    )
+                })?;
+                Ok(PendingEmbeddingAudio::Owned(Arc::from(samples)))
+            }
+        }
+    }
+}
 use super::{clean_masks, select_speaker_weights, write_speaker_mask_to_slice};
 
 pub(super) struct ConcurrentEmbeddingResult {
@@ -23,30 +83,105 @@ impl ConcurrentEmbeddingResult {
     }
 }
 
-/// Compute total window count matching the streaming segmentation sliding-window logic
-/// Includes the zero-padded tail window. Returns 0 when audio is shorter than one window
-fn streaming_total_windows(audio_len: usize, window_samples: usize, step_samples: usize) -> usize {
-    let full_windows = if audio_len >= window_samples {
-        (audio_len - window_samples) / step_samples + 1
-    } else {
-        return 0;
-    };
-    let offset_after_full = full_windows * step_samples;
-    let has_tail = offset_after_full < audio_len;
-    full_windows + has_tail as usize
-}
-
 struct MultiMaskBatch<'a> {
-    audio_slices: &'a [&'a [f32]],
+    audio_slices: &'a [PendingEmbeddingAudio<'a>],
     flat_masks: &'a [f32],
     mask_stride: usize,
     active_flags: &'a [bool],
     chunk_indices: &'a [usize],
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ConcurrentAudio, PendingEmbeddingAudio};
+    use crate::audio_source::{AudioSource, AudioSourceError, SliceAudioSource};
+
+    struct FailingSource {
+        samples: Vec<f32>,
+        fail_at: usize,
+    }
+
+    impl AudioSource for FailingSource {
+        fn sample_count(&self) -> usize {
+            self.samples.len()
+        }
+
+        fn read_exact_samples(
+            &self,
+            start: usize,
+            destination: &mut [f32],
+        ) -> Result<(), AudioSourceError> {
+            if start >= self.fail_at {
+                return Err(AudioSourceError::Cancelled);
+            }
+            let end = start + destination.len();
+            destination.copy_from_slice(
+                self.samples
+                    .get(start..end)
+                    .ok_or(AudioSourceError::InvalidRange)?,
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn source_concurrent_windows_match_slice_tail_and_order() {
+        let samples: Vec<f32> = (0..23).map(|sample| sample as f32).collect();
+        let slice = SliceAudioSource::new(&samples);
+        let read = |start, destination: &mut [f32]| slice.read_exact_samples(start, destination);
+        let source_slice = ConcurrentAudio::Source {
+            sample_count: slice.sample_count(),
+            read_exact: &read,
+        };
+        let whole_slice = ConcurrentAudio::Slice(&samples);
+        assert_eq!(source_slice.total_windows(8, 5), 5);
+        assert_eq!(whole_slice.total_windows(8, 5), 5);
+
+        for index in 0..5 {
+            let expected = whole_slice.window(5, 8, index).unwrap();
+            let actual = source_slice.window(5, 8, index).unwrap();
+            assert_eq!(expected.as_slice(), actual.as_slice());
+            if index == 4 {
+                assert_eq!(actual.as_slice(), &[20., 21., 22.]);
+            }
+        }
+    }
+
+    #[test]
+    fn source_concurrent_windows_surface_read_cancellation() {
+        let source = FailingSource {
+            samples: (0..32).map(|sample| sample as f32).collect(),
+            fail_at: 8,
+        };
+        let read = |start, destination: &mut [f32]| source.read_exact_samples(start, destination);
+        let audio = ConcurrentAudio::Source {
+            sample_count: source.sample_count(),
+            read_exact: &read,
+        };
+        assert!(matches!(
+            audio.window(4, 8, 2),
+            Err(crate::pipeline::PipelineError::Segmentation(
+                crate::inference::segmentation::SegmentationError::AudioSource(
+                    AudioSourceError::Cancelled
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn concurrent_audio_enum_keeps_borrowed_slice_path_zero_copy() {
+        let samples = [1.0, 2.0, 3.0];
+        let audio = ConcurrentAudio::Slice(&samples);
+        match audio.window(1, 3, 0).unwrap() {
+            PendingEmbeddingAudio::Borrowed(slice) => assert_eq!(slice, &samples),
+            PendingEmbeddingAudio::Owned(_) => panic!("slice path unexpectedly copied audio"),
+        }
+    }
+}
+
 pub(super) struct ConcurrentEmbeddingRunner<'a> {
     pub powerset: &'a PowersetMapping,
-    pub audio: &'a [f32],
+    pub audio: ConcurrentAudio<'a>,
     pub step_samples: usize,
     pub window_samples: usize,
     pub num_speakers: usize,
@@ -54,7 +189,8 @@ pub(super) struct ConcurrentEmbeddingRunner<'a> {
 
 impl<'a> ConcurrentEmbeddingRunner<'a> {
     fn total_windows(&self) -> usize {
-        streaming_total_windows(self.audio.len(), self.window_samples, self.step_samples)
+        self.audio
+            .total_windows(self.window_samples, self.step_samples)
     }
 
     pub fn run_split(
@@ -80,26 +216,36 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
             drop(decoded);
 
             let seg_view = seg.slice(s![chunk_idx, .., ..]);
-            let chunk_audio = chunk_audio_raw(
-                self.audio,
-                self.step_samples,
-                self.window_samples,
-                chunk_idx,
-            );
+            let chunk_audio =
+                self.audio
+                    .window(self.step_samples, self.window_samples, chunk_idx)?;
+            let chunk_audio_samples = chunk_audio.as_slice();
             let clean = clean_masks(&seg_view);
 
-            let fbank = embedding_model.compute_chunk_fbank(chunk_audio)?;
+            let speaker_weights: Vec<_> = (0..self.num_speakers)
+                .map(|speaker_idx| {
+                    select_speaker_weights(
+                        &seg_view,
+                        &clean,
+                        speaker_idx,
+                        chunk_audio_samples.len(),
+                        min_num_samples,
+                    )
+                })
+                .collect();
+            if speaker_weights.iter().all(Option::is_none) {
+                // Silent windows need no fbank. Avoid retaining one fbank per silent window
+                // while waiting for the next embedding batch to fill.
+                chunk_idx += 1;
+                continue;
+            }
+
+            let fbank = embedding_model.compute_chunk_fbank(chunk_audio_samples)?;
             fbanks.push(fbank);
             let mut current_fbank_idx = fbanks.len() - 1;
 
-            for speaker_idx in 0..self.num_speakers {
-                let Some(weights) = select_speaker_weights(
-                    &seg_view,
-                    &clean,
-                    speaker_idx,
-                    chunk_audio.len(),
-                    min_num_samples,
-                ) else {
+            for (speaker_idx, weights) in speaker_weights.into_iter().enumerate() {
+                let Some(weights) = weights else {
                     continue;
                 };
                 pending.push(PendingSplitEmbedding {
@@ -153,7 +299,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
 
         // buffer audio slices instead of pre-computed fbanks — fbanks are computed
         // in a single batched call per flush, avoiding redundant per-window computation
-        let mut audio_buffer: Vec<&[f32]> = Vec::with_capacity(batch_size);
+        let mut audio_buffer: Vec<PendingEmbeddingAudio<'_>> = Vec::with_capacity(batch_size);
         let mask_capacity = batch_size * self.num_speakers;
         // flat mask buffer: one contiguous allocation, indexed by [slot * nf .. (slot+1) * nf]
         let mut flat_masks: Vec<f32> = Vec::new();
@@ -189,12 +335,11 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
             drop(decoded);
 
             let seg_view = seg.slice(s![chunk_idx, .., ..]);
-            let chunk_audio = chunk_audio_raw(
-                self.audio,
-                self.step_samples,
-                self.window_samples,
-                chunk_idx,
-            );
+            let chunk_audio =
+                self.audio
+                    .window(self.step_samples, self.window_samples, chunk_idx)?;
+            let chunk_audio_samples = chunk_audio.as_slice();
+            let chunk_audio_len = chunk_audio_samples.len();
             audio_buffer.push(chunk_audio);
             chunk_indices.push(chunk_idx);
 
@@ -206,7 +351,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
                 let active = write_speaker_mask_to_slice(
                     &seg_view,
                     speaker_idx,
-                    chunk_audio.len(),
+                    chunk_audio_len,
                     min_num_samples,
                     dest,
                 );
@@ -277,11 +422,16 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
         storage: &mut S,
     ) -> Result<(u64, u64), PipelineError> {
         let fbank_start = std::time::Instant::now();
-        let fbanks = embedding_model.compute_chunk_fbanks_batch(batch.audio_slices)?;
+        let audio_refs: Vec<&[f32]> = batch
+            .audio_slices
+            .iter()
+            .map(|audio| audio.as_slice())
+            .collect();
+        let fbanks = embedding_model.compute_chunk_fbanks_batch(&audio_refs)?;
         let fbank_us = fbank_start.elapsed().as_micros() as u64;
 
         let fbank_refs: Vec<_> = fbanks.iter().collect();
-        let num_masks = batch.audio_slices.len() * self.num_speakers;
+        let num_masks = audio_refs.len() * self.num_speakers;
         let mask_refs: Vec<&[f32]> = batch
             .flat_masks
             .chunks(batch.mask_stride)
@@ -348,12 +498,9 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
             drop(decoded);
 
             let seg_view = seg.slice(s![chunk_idx, .., ..]);
-            let chunk_audio = chunk_audio_raw(
-                self.audio,
-                self.step_samples,
-                self.window_samples,
-                chunk_idx,
-            );
+            let chunk_audio =
+                self.audio
+                    .window(self.step_samples, self.window_samples, chunk_idx)?;
             let clean = clean_masks(&seg_view);
 
             for speaker_idx in 0..self.num_speakers {
@@ -368,7 +515,7 @@ impl<'a> ConcurrentEmbeddingRunner<'a> {
                 pending.push(PendingEmbedding {
                     chunk_idx,
                     speaker_idx,
-                    audio: chunk_audio,
+                    audio: chunk_audio.clone(),
                     mask: mask_col.to_vec(),
                     clean_mask: clean.column(speaker_idx).to_vec(),
                 });

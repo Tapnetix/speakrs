@@ -9,7 +9,8 @@ pub use data::{
     DiscreteDiarization, InferenceArtifacts, SpeakerCountTrack,
 };
 pub(super) use data::{
-    EmbeddingPath, InferencePath, PendingEmbedding, PendingSplitEmbedding, RawSegmentationWindows,
+    EmbeddingPath, InferencePath, PendingEmbedding, PendingEmbeddingAudio, PendingSourceEmbedding,
+    PendingSplitEmbedding, RawSegmentationWindows,
 };
 pub use error::PipelineError;
 pub(super) use extract::{Array3Writer, EmbeddingStorage, flush_masked, flush_split};

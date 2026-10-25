@@ -206,6 +206,9 @@ compile_error!("the `coreml` feature is only supported on macOS");
 pub(crate) mod binarize;
 pub(crate) mod clustering;
 /// Segmentation and embedding model wrappers
+// RecapIt extension: expose the bounded random-access input protocol added in
+// `audio_source.rs`; the upstream inference and clustering APIs are unchanged.
+pub mod audio_source;
 pub mod inference;
 pub(crate) mod linalg;
 /// Diarization error rate (DER) evaluation utilities

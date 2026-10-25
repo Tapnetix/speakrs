@@ -2,6 +2,7 @@
 use ndarray::{Array2, Array3};
 
 use super::SegmentationError;
+use crate::audio_source::{AudioSource, AudioWindowPlan};
 
 pub(super) type OutputShape3 = (usize, usize, usize);
 
@@ -10,6 +11,52 @@ pub(super) struct SegmentationWindows<'a> {
     offsets: Vec<usize>,
     padded: Option<Vec<f32>>,
     window_samples: usize,
+}
+
+/// Window access shared by slice and random-access sources. Implementations fill the bounded
+/// destination directly so parallel CoreML workers never need a recording-sized raw-window list.
+pub(super) trait SegmentationWindowReader: Sync {
+    fn total_windows(&self) -> usize;
+    fn read_window_into(
+        &self,
+        idx: usize,
+        destination: &mut [f32],
+        context: &'static str,
+    ) -> Result<(), SegmentationError>;
+}
+
+pub(super) struct SourceSegmentationWindows<'a, S: AudioSource + ?Sized> {
+    source: &'a S,
+    plan: AudioWindowPlan,
+}
+
+impl<'a, S: AudioSource + ?Sized> SourceSegmentationWindows<'a, S> {
+    pub(super) fn new(
+        source: &'a S,
+        window_samples: usize,
+        step_samples: usize,
+    ) -> Result<Self, SegmentationError> {
+        Ok(Self {
+            source,
+            plan: AudioWindowPlan::new(source.sample_count(), window_samples, step_samples)?,
+        })
+    }
+}
+
+impl<S: AudioSource + ?Sized> SegmentationWindowReader for SourceSegmentationWindows<'_, S> {
+    fn total_windows(&self) -> usize {
+        self.plan.window_count()
+    }
+
+    fn read_window_into(
+        &self,
+        idx: usize,
+        destination: &mut [f32],
+        _context: &'static str,
+    ) -> Result<(), SegmentationError> {
+        self.plan.read_window_into(self.source, idx, destination)?;
+        Ok(())
+    }
 }
 
 impl<'a> SegmentationWindows<'a> {
@@ -66,6 +113,31 @@ impl<'a> SegmentationWindows<'a> {
                 self.total_windows()
             ),
         })
+    }
+}
+
+#[cfg(feature = "coreml")]
+impl SegmentationWindowReader for SegmentationWindows<'_> {
+    fn total_windows(&self) -> usize {
+        self.total_windows()
+    }
+
+    fn read_window_into(
+        &self,
+        idx: usize,
+        destination: &mut [f32],
+        context: &'static str,
+    ) -> Result<(), SegmentationError> {
+        let window = self.window(idx, context)?;
+        if destination.len() != self.window_samples || window.len() > destination.len() {
+            return Err(SegmentationError::Invariant {
+                context,
+                message: "window destination has an unexpected size".to_owned(),
+            });
+        }
+        destination.fill(0.0);
+        destination[..window.len()].copy_from_slice(window);
+        Ok(())
     }
 }
 
@@ -163,7 +235,76 @@ pub(super) fn worker_panic(worker: &'static str) -> SegmentationError {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_output, output_shape3};
+    use super::{SegmentationWindowReader, SourceSegmentationWindows, first_output, output_shape3};
+    use crate::audio_source::{AudioSource, AudioSourceError, SliceAudioSource};
+
+    struct FailingSource {
+        samples: Vec<f32>,
+        failure: AudioSourceError,
+    }
+
+    impl AudioSource for FailingSource {
+        fn sample_count(&self) -> usize {
+            self.samples.len()
+        }
+
+        fn read_exact_samples(
+            &self,
+            start: usize,
+            destination: &mut [f32],
+        ) -> Result<(), AudioSourceError> {
+            if start >= 4 {
+                return Err(self.failure);
+            }
+            let end = start + destination.len();
+            destination.copy_from_slice(
+                self.samples
+                    .get(start..end)
+                    .ok_or(AudioSourceError::InvalidRange)?,
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn source_window_reader_matches_slice_order_and_tail_padding() {
+        let samples: Vec<f32> = (0..23).map(|sample| sample as f32).collect();
+        let slice = SliceAudioSource::new(&samples);
+        let windows = SourceSegmentationWindows::new(&slice, 8, 5).unwrap();
+        assert_eq!(windows.total_windows(), 5);
+
+        let expected = [
+            vec![0., 1., 2., 3., 4., 5., 6., 7.],
+            vec![5., 6., 7., 8., 9., 10., 11., 12.],
+            vec![10., 11., 12., 13., 14., 15., 16., 17.],
+            vec![15., 16., 17., 18., 19., 20., 21., 22.],
+            vec![20., 21., 22., 0., 0., 0., 0., 0.],
+        ];
+        for (index, expected_window) in expected.iter().enumerate() {
+            let mut actual = vec![f32::NAN; 8];
+            windows
+                .read_window_into(index, &mut actual, "test source windows")
+                .unwrap();
+            assert_eq!(&actual, expected_window);
+        }
+    }
+
+    #[test]
+    fn source_window_reader_propagates_reader_failure_categories() {
+        for failure in [AudioSourceError::ReadFailed, AudioSourceError::Cancelled] {
+            let source = FailingSource {
+                samples: (0..20).map(|sample| sample as f32).collect(),
+                failure,
+            };
+            let windows = SourceSegmentationWindows::new(&source, 8, 4).unwrap();
+            let mut buffer = vec![0.0; 8];
+            assert!(matches!(
+                windows.read_window_into(1, &mut buffer, "test source windows"),
+                Err(crate::inference::segmentation::SegmentationError::AudioSource(error))
+                    if error == failure
+            ));
+        }
+    }
 
     #[test]
     fn first_output_reports_missing_tensor() {

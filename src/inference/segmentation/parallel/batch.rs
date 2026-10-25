@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, Sender};
 use ndarray::Array2;
 
 use super::{
-    BatchTask, ParallelProfile, SegmentationError, SegmentationWindows, WorkerErrorSlot,
+    BatchTask, ParallelProfile, SegmentationError, SegmentationWindowReader, WorkerErrorSlot,
     segmentation_array_from_slice, worker_panic,
 };
 use crate::inference::coreml::CachedInputShape;
@@ -14,7 +14,7 @@ use crate::inference::coreml::CachedInputShape;
 type QueuedBatch = (usize, Vec<Array2<f32>>);
 
 pub(super) struct ParallelBatchExecutor<'a> {
-    pub(super) windows: &'a SegmentationWindows<'a>,
+    pub(super) windows: &'a dyn SegmentationWindowReader,
     pub(super) tx: Sender<Array2<f32>>,
     pub(super) tasks: Vec<BatchTask<'a>>,
     pub(super) num_workers: usize,
@@ -97,7 +97,7 @@ impl BatchScratch {
 
 struct BatchWorker<'ctx, 'a> {
     tasks: &'ctx [BatchTask<'a>],
-    windows: &'ctx SegmentationWindows<'a>,
+    windows: &'ctx dyn SegmentationWindowReader,
     batch_tx: Sender<QueuedBatch>,
     next_task: Arc<AtomicUsize>,
     worker_error: WorkerErrorSlot,
@@ -110,6 +110,9 @@ impl<'ctx, 'a> BatchWorker<'ctx, 'a> {
         let mut scratch = BatchScratch::default();
 
         while let Some(task) = self.claim_next_task() {
+            if self.worker_error.is_set() {
+                return;
+            }
             let results = match self.process_task(task, &mut scratch) {
                 Ok(results) => results,
                 Err(error) => {
@@ -148,18 +151,12 @@ impl<'ctx, 'a> BatchWorker<'ctx, 'a> {
     ) -> Result<(), SegmentationError> {
         batch_buf.fill(0.0);
         for (batch_offset, window_idx) in (task.start..task.end).enumerate() {
-            let window = self
-                .windows
-                .window(window_idx, "parallel segmentation batch")
-                .map_err(|_| SegmentationError::Invariant {
-                    context: "parallel segmentation batch",
-                    message: format!(
-                        "failed to resolve window {window_idx} for batch {}",
-                        task.batch_idx
-                    ),
-                })?;
             let dst = batch_offset * self.window_samples;
-            batch_buf[dst..dst + window.len()].copy_from_slice(window);
+            self.windows.read_window_into(
+                window_idx,
+                &mut batch_buf[dst..dst + self.window_samples],
+                "parallel segmentation batch",
+            )?;
         }
 
         Ok(())
@@ -250,7 +247,7 @@ impl<'a> ParallelBatchExecutor<'a> {
 
     fn run_workers(
         tasks: &[BatchTask<'a>],
-        windows: &SegmentationWindows<'a>,
+        windows: &dyn SegmentationWindowReader,
         batch_tx: &Sender<QueuedBatch>,
         num_workers: usize,
         window_samples: usize,

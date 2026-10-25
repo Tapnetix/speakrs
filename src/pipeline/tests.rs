@@ -1,12 +1,17 @@
+use ndarray::ArrayViewD;
 use ndarray::{Array1, Array2, Array3, array, s};
 use ndarray_npy::ReadNpyExt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use super::*;
-#[cfg(feature = "coreml")]
+#[cfg(any(feature = "coreml", feature = "cuda", feature = "migraphx"))]
 use crate::inference::ExecutionMode;
 use crate::inference::{DynamicRuntimeError, ModelLoadError, OrtRuntimeError};
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
+use crate::audio_source::{AudioSource, AudioSourceError, SliceAudioSource};
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // --- test helpers ---
 
@@ -314,6 +319,105 @@ fn assert_embedding_tensor_close(actual: &Array3<f32>, expected: &Array3<f32>, e
     }
 }
 
+fn compare_f32_arrays(
+    field: &str,
+    actual: ArrayViewD<'_, f32>,
+    expected: ArrayViewD<'_, f32>,
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
+    allow_matching_nan: bool,
+) -> Result<(), String> {
+    if actual.shape() != expected.shape() {
+        return Err(format!(
+            "{field} shape differs: {:?} vs {:?}",
+            actual.shape(),
+            expected.shape()
+        ));
+    }
+    if actual.is_empty() {
+        return Err(format!("{field} unexpectedly has no values"));
+    }
+
+    let mut finite_values = 0;
+    for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        if actual.is_nan() && expected.is_nan() && allow_matching_nan {
+            continue;
+        }
+        if !actual.is_finite() || !expected.is_finite() {
+            return Err(format!(
+                "{field}[{index}] has unmatched NaN or infinity: slice={actual}, source={expected}"
+            ));
+        }
+        finite_values += 1;
+        let tolerance = absolute_tolerance + relative_tolerance * expected.abs();
+        if (actual - expected).abs() > tolerance {
+            return Err(format!(
+                "{field}[{index}] differs: slice={actual}, source={expected}, tolerance={tolerance}"
+            ));
+        }
+    }
+    if finite_values == 0 {
+        return Err(format!("{field} contains no finite values"));
+    }
+    Ok(())
+}
+
+fn assert_f32_arrays_close(
+    field: &str,
+    actual: ArrayViewD<'_, f32>,
+    expected: ArrayViewD<'_, f32>,
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
+    allow_matching_nan: bool,
+) {
+    if let Err(error) = compare_f32_arrays(
+        field,
+        actual,
+        expected,
+        absolute_tolerance,
+        relative_tolerance,
+        allow_matching_nan,
+    ) {
+        panic!("{error}");
+    }
+}
+
+#[cfg(feature = "coreml")]
+fn assert_coreml_pipeline_results_match(
+    slice_result: &DiarizationResult,
+    source_result: &DiarizationResult,
+    file_id: &str,
+) {
+    assert!(
+        !slice_result.segments.is_empty(),
+        "fixture must produce diarized speech"
+    );
+    assert_eq!(slice_result.speaker_count.0, source_result.speaker_count.0);
+    assert_eq!(slice_result.hard_clusters.0, source_result.hard_clusters.0);
+    assert_eq!(slice_result.segments, source_result.segments);
+    assert_eq!(slice_result.rttm(file_id), source_result.rttm(file_id));
+    assert_f32_arrays_close(
+        "CoreML segmentations",
+        slice_result.segmentations.0.view().into_dyn(),
+        source_result.segmentations.0.view().into_dyn(),
+        1e-5,
+        1e-5,
+        false,
+    );
+    assert_f32_arrays_close(
+        "CoreML embeddings",
+        slice_result.embeddings.0.view().into_dyn(),
+        source_result.embeddings.0.view().into_dyn(),
+        1e-5,
+        1e-5,
+        true,
+    );
+    assert_eq!(
+        slice_result.discrete_diarization.0,
+        source_result.discrete_diarization.0
+    );
+}
+
 #[cfg(feature = "coreml")]
 fn assert_segmentation_tensor_matches(actual: &Array3<f32>, expected: &Array3<f32>) {
     for chunk_idx in 0..actual.shape()[0] {
@@ -582,6 +686,546 @@ fn run_inference_only_plus_finish_matches_run_with_config() {
     let split = pipeline.finish_post_inference(artifacts, &config).unwrap();
 
     assert_eq!(combined.segments, split.segments);
+}
+
+#[test]
+fn float_parity_comparison_handles_inactive_embedding_rows_only_as_paired_nan() {
+    let matching_nan_actual = Array1::from_vec(vec![0.25, f32::NAN]);
+    let matching_nan_expected = Array1::from_vec(vec![0.25 + 1e-6, f32::NAN]);
+    assert!(
+        compare_f32_arrays(
+            "embeddings",
+            matching_nan_actual.view().into_dyn(),
+            matching_nan_expected.view().into_dyn(),
+            1e-5,
+            1e-5,
+            true,
+        )
+        .is_ok()
+    );
+
+    let unmatched_nan = Array1::from_vec(vec![0.25, f32::NAN]);
+    let finite = Array1::from_vec(vec![0.25, 0.0]);
+    assert!(
+        compare_f32_arrays(
+            "embeddings",
+            unmatched_nan.view().into_dyn(),
+            finite.view().into_dyn(),
+            1e-5,
+            1e-5,
+            true,
+        )
+        .is_err()
+    );
+
+    let infinity = Array1::from_vec(vec![f32::INFINITY]);
+    let finite = Array1::from_vec(vec![1.0]);
+    assert!(
+        compare_f32_arrays(
+            "segmentations",
+            infinity.view().into_dyn(),
+            finite.view().into_dyn(),
+            1e-5,
+            1e-5,
+            false,
+        )
+        .is_err()
+    );
+
+    let too_far = Array1::from_vec(vec![0.26]);
+    let reference = Array1::from_vec(vec![0.25]);
+    assert!(
+        compare_f32_arrays(
+            "embeddings",
+            too_far.view().into_dyn(),
+            reference.view().into_dyn(),
+            1e-5,
+            1e-5,
+            true,
+        )
+        .is_err()
+    );
+}
+
+/// Run explicitly with `--ignored` and a fixture overlay containing test.wav and the pinned
+/// CPU model files. This deliberately bypasses the suite's skip-on-missing-dynamic-runtime
+/// helpers: this test must execute both complete pipelines or fail with a setup/model error.
+#[test]
+#[ignore = "requires the pinned Community-1 CPU model fixture and statically linked ONNX Runtime"]
+fn cpu_slice_and_source_match_complete_pipeline_result() {
+    assert!(
+        !cfg!(feature = "load-dynamic"),
+        "run this parity check without the load-dynamic feature so ORT is statically linked"
+    );
+
+    let audio_path = fixture_path("test.wav");
+    assert!(
+        audio_path.is_file(),
+        "missing parity audio fixture: {}",
+        audio_path.display()
+    );
+    let harness = PipelineTestHarness::load();
+    let required_cpu_models = [
+        "segmentation-3.0.onnx",
+        "wespeaker-voxceleb-resnet34.onnx",
+        "wespeaker-voxceleb-resnet34.onnx.data",
+        "plda_lda.npy",
+        "plda_tr.npy",
+        "plda_mu.npy",
+        "plda_psi.npy",
+        "plda_mean1.npy",
+        "plda_mean2.npy",
+        "wespeaker-voxceleb-resnet34.min_num_samples.txt",
+    ];
+    for model in required_cpu_models {
+        let path = harness.models_dir().join(model);
+        assert!(
+            path.is_file(),
+            "missing pinned CPU model fixture: {}",
+            path.display()
+        );
+    }
+
+    let mut pipeline = PipelineBuilder::from_dir(harness.models_dir(), ExecutionMode::Cpu)
+        .build()
+        .expect("statically linked ONNX Runtime and pinned CPU model files must load");
+    let audio = harness.audio();
+    assert!(
+        audio.len() > 160_000,
+        "fixture should exercise multiple segmentation windows"
+    );
+
+    let slice_result = pipeline
+        .run_with_file_id(audio, "community1-parity")
+        .expect("slice-backed complete CPU pipeline must run");
+    let source = crate::audio_source::SliceAudioSource::new(audio);
+    let source_result = pipeline
+        .run_source(&source, "community1-parity")
+        .expect("source-backed complete CPU pipeline must run");
+
+    assert!(
+        !slice_result.segments.is_empty(),
+        "fixture must produce diarized speech"
+    );
+    assert_eq!(slice_result.speaker_count.0, source_result.speaker_count.0);
+    assert_eq!(slice_result.hard_clusters.0, source_result.hard_clusters.0);
+    assert_eq!(slice_result.segments, source_result.segments);
+    assert_eq!(
+        slice_result.rttm("community1-parity"),
+        source_result.rttm("community1-parity")
+    );
+
+    assert_f32_arrays_close(
+        "segmentations",
+        slice_result.segmentations.0.view().into_dyn(),
+        source_result.segmentations.0.view().into_dyn(),
+        1e-5,
+        1e-5,
+        false,
+    );
+    assert_f32_arrays_close(
+        "embeddings",
+        slice_result.embeddings.0.view().into_dyn(),
+        source_result.embeddings.0.view().into_dyn(),
+        1e-5,
+        1e-5,
+        true,
+    );
+    assert_eq!(
+        slice_result.discrete_diarization.0,
+        source_result.discrete_diarization.0
+    );
+}
+
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
+struct FailingQualificationSource {
+    sample_count: usize,
+    failure: AudioSourceError,
+    reads: AtomicUsize,
+}
+
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
+impl AudioSource for FailingQualificationSource {
+    fn sample_count(&self) -> usize {
+        self.sample_count
+    }
+
+    fn read_exact_samples(
+        &self,
+        _start: usize,
+        _destination: &mut [f32],
+    ) -> Result<(), AudioSourceError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        Err(self.failure)
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
+fn assert_accelerator_source_results_match(
+    mode_name: &str,
+    slice_result: &DiarizationResult,
+    source_result: &DiarizationResult,
+    file_id: &str,
+) {
+    assert!(
+        !slice_result.segments.is_empty(),
+        "{mode_name} fixture must produce diarized speech"
+    );
+    assert_eq!(slice_result.speaker_count.0, source_result.speaker_count.0);
+    assert_eq!(slice_result.hard_clusters.0, source_result.hard_clusters.0);
+    assert_eq!(slice_result.segments, source_result.segments);
+    assert_eq!(slice_result.rttm(file_id), source_result.rttm(file_id));
+    assert_f32_arrays_close(
+        &format!("{mode_name} segmentations"),
+        slice_result.segmentations.0.view().into_dyn(),
+        source_result.segmentations.0.view().into_dyn(),
+        1e-5,
+        1e-5,
+        false,
+    );
+    assert_f32_arrays_close(
+        &format!("{mode_name} embeddings"),
+        slice_result.embeddings.0.view().into_dyn(),
+        source_result.embeddings.0.view().into_dyn(),
+        1e-5,
+        1e-5,
+        true,
+    );
+    assert_eq!(
+        slice_result.discrete_diarization.0,
+        source_result.discrete_diarization.0
+    );
+}
+
+#[cfg(any(feature = "cuda", feature = "migraphx"))]
+fn assert_accelerator_source_qualification(mode: ExecutionMode, mode_name: &str) {
+    assert!(
+        !cfg!(feature = "load-dynamic"),
+        "run accelerator source qualification with statically linked ONNX Runtime"
+    );
+
+    let audio_path = fixture_path("test.wav");
+    assert!(
+        audio_path.is_file(),
+        "missing parity audio fixture: {}",
+        audio_path.display()
+    );
+    let harness = PipelineTestHarness::load();
+    for model in [
+        "segmentation-3.0.onnx",
+        "segmentation-3.0-b32.onnx",
+        "wespeaker-voxceleb-resnet34.onnx",
+        "wespeaker-voxceleb-resnet34.onnx.data",
+        "wespeaker-fbank.onnx",
+        "wespeaker-fbank-b32.onnx",
+        "wespeaker-multimask-tail.onnx",
+        "wespeaker-multimask-tail-b32.onnx",
+        "wespeaker-voxceleb-resnet34-b64.onnx",
+        "plda_lda.npy",
+        "plda_tr.npy",
+        "plda_mu.npy",
+        "plda_psi.npy",
+        "plda_mean1.npy",
+        "plda_mean2.npy",
+        "wespeaker-voxceleb-resnet34.min_num_samples.txt",
+    ] {
+        let path = harness.models_dir().join(model);
+        assert!(
+            path.is_file(),
+            "missing pinned {mode_name} prerequisite: {}",
+            path.display()
+        );
+    }
+
+    let audio = harness.audio();
+    assert!(audio.len() > 160_000);
+    let mut pipeline = PipelineBuilder::from_dir(harness.models_dir(), mode)
+        .build()
+        .unwrap_or_else(|error| {
+            panic!("pinned {mode_name} provider and model files must load: {error:#}")
+        });
+    assert_eq!(
+        pipeline.seg_model.mode(),
+        mode,
+        "{mode_name} configured execution mode changed during load"
+    );
+
+    let short_slice = pipeline
+        .run_with_file_id(audio, "community1-accelerator-short")
+        .unwrap_or_else(|error| panic!("slice-backed {mode_name} pipeline failed: {error:#}"));
+    let short_source = SliceAudioSource::new(audio);
+    let short_range = pipeline
+        .run_source(&short_source, "community1-accelerator-short")
+        .unwrap_or_else(|error| panic!("source-backed {mode_name} pipeline failed: {error:#}"));
+    assert_accelerator_source_results_match(
+        mode_name,
+        &short_slice,
+        &short_range,
+        "community1-accelerator-short",
+    );
+    assert_eq!(
+        pipeline.seg_model.mode(),
+        mode,
+        "{mode_name} configured execution mode changed after parity run"
+    );
+
+    // Cross the generic concurrent path's selected embedding batch boundary
+    // and leave a padded final segmentation window. This uses the active GPU
+    // model's ordinary batch geometry, independently of CoreML chunk capacity.
+    let source_batch_size = if pipeline.emb_model.prefers_multi_mask_path()
+        && pipeline.emb_model.multi_mask_batch_size() > 0
+    {
+        pipeline.emb_model.multi_mask_batch_size()
+    } else if pipeline.emb_model.prefers_chunk_embedding_path()
+        && pipeline.emb_model.split_primary_batch_size() > 0
+    {
+        pipeline.emb_model.split_primary_batch_size()
+    } else {
+        pipeline.emb_model.primary_batch_size()
+    };
+    assert!(source_batch_size > 0, "accelerator model must expose a batch size");
+    let boundary_len = pipeline
+        .seg_model
+        .window_samples()
+        .checked_add(
+            source_batch_size
+                .checked_sub(1)
+                .and_then(|windows| windows.checked_mul(pipeline.seg_model.step_samples()))
+                .expect("boundary step count"),
+        )
+        .and_then(|samples| samples.checked_add(1))
+        .expect("accelerator boundary fixture length must fit usize");
+    let boundary_audio: Vec<f32> = audio
+        .iter()
+        .copied()
+        .cycle()
+        .take(boundary_len)
+        .collect();
+    let boundary_plan = crate::audio_source::AudioWindowPlan::new(
+        boundary_audio.len(),
+        pipeline.seg_model.window_samples(),
+        pipeline.seg_model.step_samples(),
+    )
+    .expect("accelerator boundary fixture must have a valid window plan");
+    assert_eq!(
+        boundary_plan.full_window_count(),
+        source_batch_size,
+        "fixture must contain exactly B complete windows"
+    );
+    assert!(
+        boundary_plan.has_padded_tail(),
+        "fixture must include one padded tail window"
+    );
+    assert_eq!(
+        boundary_plan.window_count(),
+        source_batch_size + 1,
+        "fixture must contain B+1 total windows"
+    );
+    let boundary_slice = pipeline
+        .run_with_file_id(&boundary_audio, "community1-accelerator-capacity-tail")
+        .unwrap_or_else(|error| {
+            panic!("slice-backed {mode_name} boundary pipeline failed: {error:#}")
+        });
+    let boundary_source = SliceAudioSource::new(&boundary_audio);
+    let boundary_range = pipeline
+        .run_source(&boundary_source, "community1-accelerator-capacity-tail")
+        .unwrap_or_else(|error| {
+            panic!("source-backed {mode_name} boundary pipeline failed: {error:#}")
+        });
+    assert_accelerator_source_results_match(
+        mode_name,
+        &boundary_slice,
+        &boundary_range,
+        "community1-accelerator-capacity-tail",
+    );
+    assert_eq!(
+        pipeline.seg_model.mode(),
+        mode,
+        "{mode_name} configured execution mode changed after tail parity run"
+    );
+
+    for failure in [AudioSourceError::ReadFailed, AudioSourceError::Cancelled] {
+        let failing = FailingQualificationSource {
+            sample_count: boundary_audio.len(),
+            failure,
+            reads: AtomicUsize::new(0),
+        };
+        let error =
+            match pipeline.run_source(&failing, "community1-accelerator-source-failure") {
+                Ok(_) => panic!("{mode_name} source failure/cancellation unexpectedly succeeded"),
+                Err(error) => error,
+            };
+        assert!(
+            error.to_string().contains(&failure.to_string()),
+            "{mode_name} source error lost its category ({failure}): {error:#}"
+        );
+        assert!(
+            failing.reads.load(Ordering::Relaxed) == 1,
+            "{mode_name} must return the immediate first-read source error without retrying"
+        );
+        assert_eq!(
+            pipeline.seg_model.mode(),
+            mode,
+            "{mode_name} configured execution mode changed after source error"
+        );
+    }
+}
+
+/// Run on NVIDIA hardware with the pinned GPU model fixture. Verifies complete slice/source
+/// parity, exactly B full windows plus one padded tail, and immediate first-read failure/cancel.
+/// The mode assertion checks the configured/requested mode value; it does not inspect actual
+/// ONNX Runtime execution-provider placement.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires NVIDIA CUDA hardware, pinned accelerator model fixture, and static ONNX Runtime"]
+fn cuda_slice_and_source_match_complete_pipeline_and_preserve_configured_mode_on_errors() {
+    assert_accelerator_source_qualification(ExecutionMode::Cuda, "CUDA");
+}
+
+/// Run on NVIDIA hardware with the pinned GPU model fixture. Verifies the fast
+/// CUDA configured mode through the same source/slice checks; this does not inspect
+/// actual ONNX Runtime execution-provider placement.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires NVIDIA CUDA hardware, pinned accelerator model fixture, and static ONNX Runtime"]
+fn cuda_fast_slice_and_source_match_complete_pipeline_and_preserve_configured_mode_on_errors() {
+    assert_accelerator_source_qualification(ExecutionMode::CudaFast, "CUDA fast");
+}
+
+/// Run on AMD ROCm/MIGraphX hardware with the pinned GPU model fixture. Verifies complete
+/// slice/source parity, exactly B full windows plus one padded tail, and immediate first-read
+/// failure/cancel. The mode assertion checks the configured/requested mode value; it does not
+/// inspect actual ONNX Runtime execution-provider placement.
+#[cfg(feature = "migraphx")]
+#[test]
+#[ignore = "requires AMD MIGraphX hardware, pinned accelerator model fixture, and static ONNX Runtime"]
+fn migraphx_slice_and_source_match_complete_pipeline_and_preserve_configured_mode_on_errors() {
+    assert_accelerator_source_qualification(ExecutionMode::MiGraphX, "MiGraphX");
+}
+
+/// Run explicitly with `--ignored` using the pinned CoreML model overlay. Both
+/// paths use the same native CoreML pipeline, so this checks source-backed
+/// window reads against the slice-backed baseline without comparing providers.
+#[cfg(feature = "coreml")]
+#[test]
+#[ignore = "requires the pinned Community-1 CoreML model fixture and statically linked ONNX Runtime"]
+fn coreml_slice_and_source_match_complete_pipeline_result() {
+    assert!(
+        !cfg!(feature = "load-dynamic"),
+        "run this parity check without the load-dynamic feature so ORT is statically linked"
+    );
+
+    let audio_path = fixture_path("test.wav");
+    assert!(
+        audio_path.is_file(),
+        "missing parity audio fixture: {}",
+        audio_path.display()
+    );
+    let harness = PipelineTestHarness::load();
+    for model in [
+        "segmentation-3.0.onnx",
+        "segmentation-3.0-b32.onnx",
+        "wespeaker-voxceleb-resnet34.onnx",
+        "wespeaker-voxceleb-resnet34.onnx.data",
+        "wespeaker-fbank.onnx",
+        "wespeaker-fbank-b32.onnx",
+        "wespeaker-voxceleb-resnet34-tail.onnx",
+        "wespeaker-voxceleb-resnet34-tail-b3.onnx",
+        "wespeaker-voxceleb-resnet34-tail-b32.onnx",
+    ] {
+        let path = harness.models_dir().join(model);
+        assert!(
+            path.is_file(),
+            "missing pinned CoreML prerequisite: {}",
+            path.display()
+        );
+    }
+    for model in [
+        "segmentation-3.0.mlmodelc",
+        "segmentation-3.0-b32.mlmodelc",
+        "segmentation-3.0-b64.mlmodelc",
+        "wespeaker-fbank.mlmodelc",
+        "wespeaker-fbank-b32.mlmodelc",
+        "wespeaker-fbank-30s.mlmodelc",
+        "wespeaker-multimask-tail-b32.mlmodelc",
+        "wespeaker-voxceleb-resnet34-tail.mlmodelc",
+        "wespeaker-voxceleb-resnet34-tail-b3.mlmodelc",
+        "wespeaker-voxceleb-resnet34-tail-b32.mlmodelc",
+        "wespeaker-chunk-emb-s12-w22.mlmodelc",
+        "wespeaker-chunk-emb-s12-w37.mlmodelc",
+        "wespeaker-chunk-emb-s12-w53.mlmodelc",
+        "wespeaker-chunk-emb-s12-w84.mlmodelc",
+        "wespeaker-chunk-emb-s12-w116.mlmodelc",
+    ] {
+        let path = harness.models_dir().join(model);
+        assert!(
+            path.is_dir(),
+            "missing pinned CoreML model bundle: {}",
+            path.display()
+        );
+    }
+    let audio = harness.audio();
+    assert!(
+        audio.len() > 160_000,
+        "fixture should exercise multiple segmentation windows"
+    );
+
+    let mut pipeline = PipelineBuilder::from_dir(harness.models_dir(), ExecutionMode::CoreMl)
+        .build()
+        .expect("native CoreML and pinned CoreML model files must load");
+    assert_eq!(pipeline.seg_model.mode(), ExecutionMode::CoreMl);
+    let chunk_capacity = pipeline
+        .emb_model
+        .chunk_window_capacity()
+        .expect("pinned CoreML models must expose a chunk embedding capacity");
+    let total_windows =
+        (audio.len() - pipeline.seg_model.window_samples()) / pipeline.seg_model.step_samples() + 1;
+    assert_eq!(total_windows, 17, "fixture targets the short-audio branch");
+    assert!(
+        total_windows < chunk_capacity,
+        "fixture must select sequential chunk embedding (windows={total_windows}, capacity={chunk_capacity})"
+    );
+
+    let slice_result = pipeline
+        .run_with_file_id(audio, "community1-parity-coreml")
+        .expect("slice-backed complete CoreML pipeline must run");
+    let source = crate::audio_source::SliceAudioSource::new(audio);
+    let source_result = pipeline
+        .run_source(&source, "community1-parity-coreml")
+        .expect("source-backed complete CoreML pipeline must run");
+
+    assert_coreml_pipeline_results_match(&slice_result, &source_result, "community1-parity-coreml");
+
+    let boundary_sample_count = pipeline
+        .seg_model
+        .window_samples()
+        .checked_add((chunk_capacity - 1) * pipeline.seg_model.step_samples())
+        .and_then(|samples| samples.checked_add(1))
+        .expect("capacity-boundary fixture length must fit usize");
+    let boundary_audio: Vec<f32> = audio
+        .iter()
+        .copied()
+        .cycle()
+        .take(boundary_sample_count)
+        .collect();
+    let boundary_windows = (boundary_audio.len() - pipeline.seg_model.window_samples())
+        / pipeline.seg_model.step_samples()
+        + 1;
+    assert_eq!(boundary_windows, chunk_capacity);
+    assert!(boundary_audio.len() > chunk_capacity * pipeline.seg_model.step_samples());
+
+    let boundary_slice_result = pipeline
+        .run_with_file_id(&boundary_audio, "community1-capacity-tail-coreml")
+        .expect("slice-backed full-capacity CoreML pipeline must run");
+    let boundary_source = crate::audio_source::SliceAudioSource::new(&boundary_audio);
+    let boundary_source_result = pipeline
+        .run_source(&boundary_source, "community1-capacity-tail-coreml")
+        .expect("source-backed full-capacity CoreML pipeline must run");
+    assert_coreml_pipeline_results_match(
+        &boundary_slice_result,
+        &boundary_source_result,
+        "community1-capacity-tail-coreml",
+    );
 }
 
 #[test]

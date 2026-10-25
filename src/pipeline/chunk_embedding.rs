@@ -1,6 +1,10 @@
 use ndarray::{Array2, Array3};
 use tracing::{debug, trace};
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::audio_source::{AudioSource, AudioSourceError};
 use crate::clustering::plda::PldaTransform;
 use crate::inference::embedding::{ChunkEmbeddingSession, EmbeddingModel};
 use crate::inference::segmentation::SegmentationModel;
@@ -24,7 +28,10 @@ mod prep;
 use collect::{FileCollector, build_chunk_artifacts};
 use error::{backend_error, invariant_error, worker_panic};
 use gpu::{BatchGpuWorker, TaggedEmbedded, TaggedPrepared, chunk_embedding_resources};
-use orchestrate::{run_pipelined, run_sequential_chunks, seg_worker_count, setup_chunk_embedding};
+use orchestrate::{
+    run_pipelined, run_pipelined_source, run_sequential_chunks, run_sequential_chunks_source,
+    seg_worker_count, setup_chunk_embedding, setup_chunk_embedding_for_len,
+};
 use prep::{BatchPrepWorker, ChunkPrep, DecodedChunk, PrepScratch, TaggedDecoded};
 
 struct ChunkParams {
@@ -34,6 +41,186 @@ struct ChunkParams {
     min_num_samples: usize,
     chunk_win_capacity: usize,
     total_windows: usize,
+}
+
+struct CancellableAudioSource<'a, S: AudioSource + ?Sized> {
+    source: &'a S,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<S: AudioSource + ?Sized> AudioSource for CancellableAudioSource<'_, S> {
+    fn sample_count(&self) -> usize {
+        self.source.sample_count()
+    }
+
+    fn read_exact_samples(
+        &self,
+        start: usize,
+        destination: &mut [f32],
+    ) -> Result<(), AudioSourceError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(AudioSourceError::Cancelled);
+        }
+        self.source.read_exact_samples(start, destination)
+    }
+}
+
+fn cancel_source_and_drain_on_error<T, E, U>(
+    result: &Result<T, E>,
+    receiver: &crossbeam_channel::Receiver<U>,
+    cancelled: &AtomicBool,
+) -> usize {
+    if result.is_err() {
+        cancelled.store(true, Ordering::Release);
+        let mut drained = 0;
+        while receiver.recv().is_ok() {
+            drained += 1;
+        }
+        drained
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::{CancellableAudioSource, cancel_source_and_drain_on_error};
+    use crate::audio_source::{AudioSource, AudioSourceError, SliceAudioSource};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct CountingSource {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        sample_count: usize,
+    }
+
+    impl AudioSource for CountingSource {
+        fn sample_count(&self) -> usize {
+            self.sample_count
+        }
+
+        fn read_exact_samples(
+            &self,
+            start: usize,
+            destination: &mut [f32],
+        ) -> Result<(), AudioSourceError> {
+            if start + destination.len() > self.sample_count {
+                return Err(AudioSourceError::InvalidRange);
+            }
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            destination.fill(start as f32);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn downstream_failure_cancels_future_source_reads() {
+        let samples = [1.0, 2.0, 3.0];
+        let source = SliceAudioSource::new(&samples);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guarded = CancellableAudioSource {
+            source: &source,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let mut window = [0.0; 2];
+        guarded.read_exact_samples(0, &mut window).unwrap();
+        assert_eq!(window, [1.0, 2.0]);
+
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            guarded.read_exact_samples(1, &mut window),
+            Err(AudioSourceError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn downstream_failure_drains_full_bounded_bridge_and_joins_workers() {
+        const CAPACITY: usize = 100;
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = CountingSource {
+            reads: Arc::clone(&reads),
+            sample_count: 2_000,
+        };
+        let sample_count = source.sample_count();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guarded = CancellableAudioSource {
+            source: &source,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (segment_tx, segment_rx) = crossbeam_channel::bounded::<usize>(CAPACITY);
+        let (decoded_tx, decoded_rx) = crossbeam_channel::bounded::<usize>(CAPACITY);
+        let segment_observer = segment_rx.clone();
+        let mut decoded_observer = Some(decoded_rx.clone());
+
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(move || {
+                for start in 0..sample_count {
+                    let mut sample = [0.0];
+                    if let Err(error) = guarded.read_exact_samples(start, &mut sample) {
+                        return Err(error);
+                    }
+                    if segment_tx.send(start).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            });
+            let bridge = scope.spawn(move || {
+                while let Ok(segment) = segment_rx.recv() {
+                    if decoded_tx.send(segment).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let fill_deadline = Instant::now() + Duration::from_secs(2);
+            while (segment_observer.len() < CAPACITY
+                || decoded_observer.as_ref().unwrap().len() < CAPACITY)
+                && Instant::now() < fill_deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let both_stages_full = segment_observer.len() == CAPACITY
+                && decoded_observer.as_ref().unwrap().len() == CAPACITY;
+            let read_count_before_cancel = reads.load(Ordering::Relaxed);
+
+            // This models the source pipeline returning an injected downstream read/model failure.
+            let consumer_result: Result<(), AudioSourceError> = Err(AudioSourceError::ReadFailed);
+            assert_eq!(consumer_result, Err(AudioSourceError::ReadFailed));
+            let (drained_tx, drained_rx) = crossbeam_channel::bounded(1);
+            let cancel_token = Arc::clone(&cancelled);
+            let drain = scope.spawn(move || {
+                let drained =
+                    cancel_source_and_drain_on_error(&consumer_result, &decoded_rx, &cancel_token);
+                let _ = drained_tx.send(drained);
+                drained
+            });
+
+            let drained_count = drained_rx.recv_timeout(Duration::from_secs(3)).ok();
+            if drained_count.is_none_or(|count| count < CAPACITY) {
+                // Ensure a regression fails promptly and releases both bounded senders.
+                cancelled.store(true, Ordering::Release);
+                drop(decoded_observer.take());
+            }
+            let producer_result = producer.join().expect("source producer joined");
+            bridge.join().expect("bridge joined");
+            let drain_count = drain.join().expect("bounded-channel drain joined");
+
+            assert!(
+                both_stages_full,
+                "both capacity-100 queues should fill before failure"
+            );
+            assert!(read_count_before_cancel > CAPACITY * 2);
+            assert!(
+                drained_count.is_some_and(|count| count >= CAPACITY),
+                "drain must finish and consume the full decoded queue within the direct test deadline"
+            );
+            assert_eq!(drain_count, drained_count.unwrap_or_default());
+            assert_eq!(producer_result, Err(AudioSourceError::Cancelled));
+            assert!(cancelled.load(Ordering::Acquire));
+        });
+    }
 }
 
 struct EmbeddingSummary {
@@ -186,6 +373,124 @@ pub(super) fn try_chunk_embedding(
 
         Ok(Some(artifacts))
     })
+}
+
+/// Preserve the CoreML chunk pipeline for file-backed sources. The source workers retain only a
+/// chunk-sized waveform scratch; segmentation and embedding keep the same bounded channels,
+/// model sessions, chunk capacity and result ordering as the slice path.
+pub(super) fn try_chunk_embedding_source<S: AudioSource + ?Sized>(
+    seg_model: &mut SegmentationModel,
+    emb_model: &mut EmbeddingModel,
+    powerset: &PowersetMapping,
+    source: &S,
+) -> Result<Option<InferenceArtifacts>, PipelineError> {
+    let Some((chunk_win_capacity, total_windows, use_pipelined, resources)) =
+        setup_chunk_embedding_for_len(seg_model, emb_model, source.sample_count())?
+    else {
+        return Ok(None);
+    };
+    if use_pipelined && resources.is_none() {
+        return Ok(None);
+    }
+    let inference_start = std::time::Instant::now();
+    let step_seconds = seg_model.step_seconds();
+    let params = ChunkParams {
+        step_samples: seg_model.step_samples(),
+        window_samples: seg_model.window_samples(),
+        num_speakers: 3,
+        min_num_samples: emb_model.min_num_samples(),
+        chunk_win_capacity,
+        total_windows,
+    };
+    let (seg_tx, seg_rx) = crossbeam_channel::bounded::<Array2<f32>>(100);
+    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<DecodedChunk>(100);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guarded_source = CancellableAudioSource {
+        source,
+        cancelled: Arc::clone(&cancelled),
+    };
+    let result = std::thread::scope(|scope| {
+        let seg_model = &mut *seg_model;
+        let source = &guarded_source;
+        let seg_tx_worker = seg_tx;
+        let segmentation = scope.spawn(move || {
+            seg_model.run_streaming_parallel_source(
+                source,
+                seg_tx_worker,
+                seg_worker_count(),
+                Some(chunk_win_capacity),
+            )
+        });
+        let bridge = scope.spawn(move || {
+            let mut group = Vec::with_capacity(chunk_win_capacity);
+            let mut global_start = 0usize;
+            for raw_window in &seg_rx {
+                group.push(powerset.hard_decode(&raw_window));
+                if group.len() == chunk_win_capacity {
+                    if chunk_tx
+                        .send(DecodedChunk {
+                            global_start,
+                            decoded_chunk: std::mem::take(&mut group),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    global_start += chunk_win_capacity;
+                    group = Vec::with_capacity(chunk_win_capacity);
+                }
+            }
+            if !group.is_empty() {
+                let _ = chunk_tx.send(DecodedChunk {
+                    global_start,
+                    decoded_chunk: group,
+                });
+            }
+        });
+        let emb_start = std::time::Instant::now();
+        let summary = if use_pipelined {
+            let resources =
+                resources.expect("pipelined source resources were checked before spawn");
+            run_pipelined_source(scope, emb_start, resources, &chunk_rx, source, &params)
+        } else {
+            run_sequential_chunks_source(emb_model, &chunk_rx, source, &params, emb_start)
+        };
+        if summary.is_err() {
+            // Stop source-window reads and drain the bounded bridge output. Otherwise the bridge
+            // can block sending while segmentation blocks sending to the bridge input channel.
+            cancel_source_and_drain_on_error(&summary, &chunk_rx, &cancelled);
+        }
+        let segmentation = segmentation
+            .join()
+            .map_err(|_| worker_panic("source chunk segmentation"))?;
+        let bridge = bridge
+            .join()
+            .map_err(|_| worker_panic("source segmentation bridge"));
+        // Drain/joins above are unconditional so read, backend, cancellation and worker failures
+        // cannot leave the segmentation producers detached.
+        let summary = summary?;
+        segmentation?;
+        bridge?;
+        let artifacts = build_chunk_artifacts(
+            step_seconds,
+            params.step_samples,
+            params.window_samples,
+            summary,
+        );
+        Ok::<_, PipelineError>(artifacts)
+    })?;
+    let inference_elapsed = inference_start.elapsed();
+    let Some(artifacts) = result else {
+        return Ok(None);
+    };
+    debug!(
+        chunks = artifacts.segmentations.shape()[0],
+        windows = total_windows,
+        audio_secs = source.sample_count() as f64 / 16_000.0,
+        inference_ms = inference_elapsed.as_millis(),
+        "Source CoreML chunk embedding complete"
+    );
+    Ok(Some(artifacts))
 }
 
 pub(super) fn try_batch_chunk_embedding(

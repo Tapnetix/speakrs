@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use ndarray::Array2;
 use ort::session::Session;
 
+use crate::audio_source::AudioSourceError;
 #[cfg(feature = "coreml")]
 use crate::inference::coreml::{CachedInputShape, SharedCoreMlModel};
 use crate::inference::{ExecutionMode, ModelLoadError, ensure_ort_ready, with_execution_mode};
@@ -20,6 +21,9 @@ pub enum SegmentationError {
     /// ONNX Runtime error
     #[error(transparent)]
     Ort(#[from] ort::Error),
+    /// Backing audio source could not provide an exact requested window
+    #[error(transparent)]
+    AudioSource(#[from] AudioSourceError),
     /// Streaming channel was closed before all windows were sent
     #[error("receiver disconnected")]
     Disconnected(#[from] crossbeam_channel::SendError<Array2<f32>>),

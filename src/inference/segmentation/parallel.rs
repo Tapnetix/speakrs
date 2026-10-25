@@ -9,9 +9,11 @@ use tracing::{debug, trace};
 
 use super::SegmentationError;
 use super::{LARGE_BATCH_SIZE, PRIMARY_BATCH_SIZE, SegmentationModel};
+use crate::audio_source::AudioSource;
 use crate::inference::coreml::SharedCoreMlModel;
 use crate::inference::segmentation::tensor::{
-    SegmentationWindows, segmentation_array, segmentation_array_from_slice, worker_panic,
+    SegmentationWindowReader, SegmentationWindows, SourceSegmentationWindows, segmentation_array,
+    segmentation_array_from_slice, worker_panic,
 };
 
 mod batch;
@@ -40,6 +42,10 @@ impl WorkerErrorSlot {
                 context: "parallel segmentation worker error slot",
                 message: "worker error slot was poisoned".to_owned(),
             })
+    }
+
+    pub(super) fn is_set(&self) -> bool {
+        self.0.lock().map(|slot| slot.is_some()).unwrap_or(true)
     }
 }
 
@@ -228,6 +234,56 @@ impl SegmentationModel {
             return self.run_streaming(audio, tx);
         };
 
+        self.run_streaming_parallel_windows(
+            &windows,
+            tx,
+            num_workers,
+            warm_start_target_windows,
+            shared_model,
+            batch_size,
+        )
+    }
+
+    /// CoreML parallel segmentation over a random-access source. Each worker reads into its
+    /// existing fixed-size scratch; only the active model batch is resident as waveform data.
+    pub fn run_streaming_parallel_source<S: AudioSource + ?Sized>(
+        &mut self,
+        source: &S,
+        tx: Sender<Array2<f32>>,
+        num_workers: usize,
+        warm_start_target_windows: Option<usize>,
+    ) -> Result<usize, SegmentationError> {
+        let windows =
+            SourceSegmentationWindows::new(source, self.window_samples, self.step_samples)?;
+        let total_windows = windows.total_windows();
+        if total_windows == 0 {
+            return Ok(0);
+        }
+        let Some((shared_model, batch_size)) = self.select_parallel_native_model(total_windows)
+        else {
+            return self.run_streaming_source(source, tx);
+        };
+        self.run_streaming_parallel_windows(
+            &windows,
+            tx,
+            num_workers,
+            warm_start_target_windows,
+            shared_model,
+            batch_size,
+        )
+    }
+
+    fn run_streaming_parallel_windows(
+        &self,
+        windows: &dyn SegmentationWindowReader,
+        tx: Sender<Array2<f32>>,
+        num_workers: usize,
+        warm_start_target_windows: Option<usize>,
+        shared_model: &SharedCoreMlModel,
+        batch_size: usize,
+    ) -> Result<usize, SegmentationError> {
+        let total_windows = windows.total_windows();
+
         let seg_start = std::time::Instant::now();
         let profile = ParallelProfile::new();
         let est_embed_chunks = warm_start_target_windows
@@ -268,7 +324,7 @@ impl SegmentationModel {
             .build()?;
 
             ParallelBatchExecutor {
-                windows: &windows,
+                windows,
                 tx,
                 tasks,
                 num_workers,
@@ -278,7 +334,7 @@ impl SegmentationModel {
             .run()?;
         } else {
             ParallelSingleExecutor {
-                windows: &windows,
+                windows,
                 tx,
                 model: shared_model,
                 num_workers: num_workers.max(1),
