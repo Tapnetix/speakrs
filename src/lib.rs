@@ -178,7 +178,7 @@
 //!
 //! BLAS backends matter if you disable default features:
 //!
-//! - `x86_64` defaults to statically linked Intel MKL
+//! - `x86_64` defaults to system OpenBLAS (Windows MSVC uses vcpkg)
 //! - non-`x86_64` defaults to statically linked OpenBLAS and needs a C toolchain
 //! - no-default builds must enable exactly one of `intel-mkl`, `openblas-static`, or `openblas-system`
 //!
